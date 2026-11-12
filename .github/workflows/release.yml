@@ -34,7 +34,7 @@ permissions:
 #   NOTARY_ISSUER_ID            The Issuer ID (UUID) from App Store Connect.
 #
 #   SPARKLE_PRIVATE_KEY         EdDSA (ed25519) private key for Sparkle update signing.
-#                               Export with: sign_update -x private_key_file
+#                               Generate/export with: generate_keys -x private_key_file
 
 env:
   SCHEME: Roster
