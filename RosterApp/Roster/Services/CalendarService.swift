@@ -34,9 +34,10 @@ nonisolated struct EventSnapshot: Identifiable, Hashable, Sendable {
     /// Whole-series scope: recurrence on the master, a detached exception, or
     /// a plain occurrence. Drives the "Add to recurring series" warning.
     var isSeries: Bool { hasRecurrenceRules || isDetached || isOccurrence }
-    /// With the amended matching rule the automation needs the calendar title
-    /// and a stable EventKit id; external identifiers proved unmappable to
-    /// Calendar scripting uids on this system.
+    /// The automation needs the calendar title and a stable EventKit id.
+    /// calendarIdentifier and calendarItemExternalIdentifier are passed as
+    /// exact-lookup hints (Calendar's scripting resolves both on iCloud) but
+    /// are not required: the script falls back to conservative matching.
     var canDrop: Bool {
         !eventIdentifier.isEmpty
             && !calendarTitle.isEmpty
@@ -71,6 +72,8 @@ final class CalendarService {
     private var scopedStore: EKEventStore?
     private var scopedSourceIDs: Set<String> = []
     private var observers: [any NSObjectProtocol] = []
+    /// Pending coalesced refetch; see `scheduleRefetch`.
+    private var refetchTask: Task<Void, Never>?
 
     private var activeStore: EKEventStore { scopedStore ?? baseStore }
 
@@ -84,7 +87,7 @@ final class CalendarService {
             ) { [weak self] _ in
                 // Documented EventKit rule: cached EKEvent objects are
                 // invalidated by store changes; refetch everything.
-                Task { await self?.refetchCalendarsAndEvents() }
+                self?.scheduleRefetch()
             }
         )
         observers.append(
@@ -92,9 +95,22 @@ final class CalendarService {
                 forName: NSNotification.Name("NSApplicationDidBecomeActiveNotification"),
                 object: nil, queue: .main
             ) { [weak self] _ in
-                Task { await self?.refetchCalendarsAndEvents() }
+                self?.scheduleRefetch()
             }
         )
+    }
+
+    /// Store changes arrive in bursts (an account sync or an automation
+    /// write can post dozens), and each refetch is a
+    /// synchronous EventKit query on the main actor. Coalesce them into one
+    /// refetch after the burst settles.
+    private func scheduleRefetch() {
+        refetchTask?.cancel()
+        refetchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            await self?.refetchCalendarsAndEvents()
+        }
     }
 
     deinit {
@@ -228,13 +244,18 @@ final class CalendarService {
     /// Attendee email addresses for one event, read in-process via
     /// EventKit. Returns nil when the event is gone or its attendee list
     /// is unknown — an unknown list must never look like an empty one, so
-    /// callers fail closed to the osascript preview instead.
+    /// callers fail closed to the osascript preview instead. EventKit reports
+    /// "no invitees" as `attendees == nil`; with `hasAttendees == false` that
+    /// is a known empty list, not an unknown one. Treating it as empty is safe
+    /// because apply re-reads attendees inside Calendar before writing.
     /// EKParticipant exposes its address only as a mailto: URL; keys are
     /// normalized exactly like the script normalizes emails.
     func attendeeEmails(forEventIdentifier identifier: String) -> [String]? {
         guard accessState == .authorized, !identifier.isEmpty else { return nil }
         guard let event = activeStore.event(withIdentifier: identifier) else { return nil }
-        guard let attendees = event.attendees else { return nil }
+        guard let attendees = event.attendees else {
+            return event.hasAttendees ? nil : []
+        }
         return attendees.compactMap { normalizedEmailKey($0.url.absoluteString) }
     }
 }
