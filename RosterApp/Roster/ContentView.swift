@@ -6,6 +6,7 @@ struct ContentView: View {
     @Bindable var model: AppModel
     @State private var pickerTarget: PickerTarget?
     @State private var showingOnboarding = false
+    @State private var showingDatePicker = false
 
     /// Set after the first-run walkthrough finishes or is skipped.
     @State private var showingStorageSheet = false
@@ -99,17 +100,73 @@ struct ContentView: View {
 
     // MARK: - Left: day list
 
-    private var dayListPane: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Button { model.calendarService.goToPreviousDay() } label: { Image(systemName: "chevron.left") }
-                Button("Today") { model.calendarService.goToToday() }
-                Button { model.calendarService.goToNextDay() } label: { Image(systemName: "chevron.right") }
-                Spacer()
-                Text(model.calendarService.day, format: .dateTime.weekday(.wide).day().month(.wide).year())
+    /// The date-picker trigger for one date format, at its natural size so
+    /// ViewThatFits can measure the complete button, bezel included.
+    private func dateButton(_ label: Text) -> some View {
+        Button {
+            showingDatePicker.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                label
                     .font(.headline)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .help("Choose a date")
+        .fixedSize()
+    }
+
+    private var dayListPane: some View {
+        let day = model.calendarService.day
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                // Navigation and the Calendars menu keep their natural
+                // size; the date button takes the space that's left and
+                // picks the longest date format that fits it.
+                Button { model.calendarService.goToPreviousDay() } label: { Image(systemName: "chevron.left") }
+                    .fixedSize()
+                Button("Today") { model.calendarService.goToToday() }
+                    .fixedSize()
+                Button { model.calendarService.goToNextDay() } label: { Image(systemName: "chevron.right") }
+                    .fixedSize()
+                Spacer()
+                // Longest date format whose whole button fits; never wraps.
+                // The narrowest drops the year only for the current year.
+                ViewThatFits(in: .horizontal) {
+                    dateButton(Text(day, format: .dateTime.weekday(.wide).day().month(.wide).year()))
+                    dateButton(Text(day, format: .dateTime.weekday(.abbreviated).day().month(.abbreviated).year()))
+                    if Calendar.current.isDate(day, equalTo: .now, toGranularity: .year) {
+                        dateButton(Text(day, format: .dateTime.weekday(.abbreviated).day().month(.abbreviated)))
+                    } else {
+                        dateButton(Text(day, format: .dateTime.day().month(.abbreviated).year()))
+                    }
+                }
+                .layoutPriority(1)
+                .popover(isPresented: $showingDatePicker, arrowEdge: .bottom) {
+                    // Graphical style is the standard macOS mini calendar:
+                    // month arrows browse without changing the day, and
+                    // picking a day jumps there and closes the popover.
+                    DatePicker(
+                        "Date",
+                        selection: Binding(
+                            get: { model.calendarService.day },
+                            set: { newDay in
+                                model.calendarService.goToDay(newDay)
+                                showingDatePicker = false
+                            }
+                        ),
+                        displayedComponents: .date
+                    )
+                    .datePickerStyle(.graphical)
+                    .labelsHidden()
+                    .padding()
+                }
                 Spacer()
                 CalendarFilterMenu(calendarService: model.calendarService)
+                    .fixedSize()
             }
             .padding(.horizontal)
 
