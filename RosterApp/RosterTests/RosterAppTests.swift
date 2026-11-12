@@ -467,9 +467,10 @@ struct MatchCandidatesTests {
         """
     }
 
-    private func meta(title: String, allDay: Bool, start: String, end: String, recurrence: Bool) -> String {
-        """
-        {"summary": "\(title)", "allDay": \(allDay), "start": "\(start)", "end": "\(end)", "hasRecurrence": \(recurrence)}
+    private func meta(title: String, allDay: Bool, start: String, end: String, recurrence: Bool, rule: String? = nil) -> String {
+        let ruleJSON = rule.map { "\"\($0)\"" } ?? "null"
+        return """
+        {"summary": "\(title)", "allDay": \(allDay), "start": "\(start)", "end": "\(end)", "hasRecurrence": \(recurrence), "recurrence": \(ruleJSON)}
         """
     }
 
@@ -528,5 +529,393 @@ struct MatchCandidatesTests {
         let b = a
         let p = payload(title: "Standup", isAllDay: false, isSeries: false, start: "2026-11-12T18:00:00Z", end: "2026-11-12T18:30:00Z")
         #expect(try runMatch(context, candidates: [a, b], payload: p).count == 2, "two matches must fail closed in the caller")
+    }
+
+    @Test func splitSeriesPicksTheMasterStillRecurring() throws {
+        let context = try makeContext()
+        // "This and future events" split: the old master was capped with
+        // UNTIL before the occurrence, the new master took over.
+        let old = meta(title: "Weekly sync", allDay: false, start: "2026-01-05T18:00:00Z", end: "2026-01-05T19:00:00Z",
+                       recurrence: true, rule: "FREQ=WEEKLY;INTERVAL=1;UNTIL=20261001T065959Z")
+        let new = meta(title: "Weekly sync", allDay: false, start: "2026-11-02T18:00:00Z", end: "2026-11-02T19:00:00Z",
+                       recurrence: true, rule: "FREQ=WEEKLY;INTERVAL=1")
+        let p = payload(title: "Weekly sync", isAllDay: false, isSeries: true, start: "2026-11-09T18:00:00Z", end: "2026-11-09T19:00:00Z")
+        #expect(try runMatch(context, candidates: [old, new], payload: p) == [1])
+    }
+
+    @Test func untilOnOrAfterOccurrenceStillMatches() throws {
+        let context = try makeContext()
+        let capped = meta(title: "Weekly sync", allDay: false, start: "2026-11-02T18:00:00Z", end: "2026-11-02T19:00:00Z",
+                          recurrence: true, rule: "FREQ=WEEKLY;UNTIL=20261109T180000Z")
+        let p = payload(title: "Weekly sync", isAllDay: false, isSeries: true, start: "2026-11-09T18:00:00Z", end: "2026-11-09T19:00:00Z")
+        #expect(try runMatch(context, candidates: [capped], payload: p) == [0])
+    }
+
+    @Test func countBoundedSeriesAreNotFiltered() throws {
+        let context = try makeContext()
+        // COUNT bounds are not expanded; both stay candidates and the caller fails closed.
+        let a = meta(title: "Weekly sync", allDay: false, start: "2026-01-05T18:00:00Z", end: "2026-01-05T19:00:00Z",
+                     recurrence: true, rule: "FREQ=WEEKLY;COUNT=4")
+        let b = meta(title: "Weekly sync", allDay: false, start: "2026-11-02T18:00:00Z", end: "2026-11-02T19:00:00Z",
+                     recurrence: true, rule: "FREQ=WEEKLY")
+        let p = payload(title: "Weekly sync", isAllDay: false, isSeries: true, start: "2026-11-09T18:00:00Z", end: "2026-11-09T19:00:00Z")
+        #expect(try runMatch(context, candidates: [a, b], payload: p).count == 2)
+    }
+
+    @Test func recurrenceUntilParsesRFC5545Forms() throws {
+        let context = try makeContext()
+        let utc = context.evaluateScript("recurrenceUntil('FREQ=WEEKLY;UNTIL=20261001T065959Z').getTime()")!.toDouble()
+        #expect(utc == Date(timeIntervalSince1970: 1_790_837_999).timeIntervalSince1970 * 1000)
+        let dateOnly = context.evaluateScript("var d = recurrenceUntil('FREQ=DAILY;UNTIL=20261001'); [d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()]")!.toArray() as? [Double]
+        #expect(dateOnly == [2026, 9, 1, 23])
+        #expect(context.evaluateScript("recurrenceUntil('FREQ=WEEKLY;COUNT=3')")!.isNull)
+        #expect(context.evaluateScript("recurrenceUntil(null)")!.isNull)
+    }
+}
+
+/// Drives findCalendars/findEvent against an in-memory stand-in for
+/// Calendar's scripting objects, so lookup rules (same-named calendars,
+/// bulk reads, failing closed) are checked without touching Calendar.app.
+@Suite("findEvent lookup")
+struct FindEventTests {
+
+    private func makeContext() throws -> JSContext {
+        let url = Bundle.main.url(forResource: "CalendarRoster", withExtension: "js")
+        guard let url else { throw TestFailure("script missing") }
+        let context = JSContext()!
+        context.evaluateScript(try String(contentsOf: url, encoding: .utf8))
+        context.evaluateScript("""
+        var stats = { perEventReads: 0, fullListings: 0, searches: 0 };
+        // Calendar resolves event ids globally, whichever calendar is asked.
+        var allEvents = [];
+        // events: [{uid, summary, start, end, allDay, recurrence}]
+        // options: {whoseFails: bool, noUidList: bool, copies: n}
+        // Mirrors measured Calendar.app behavior: bulk properties() on a
+        // specifier is unsupported, and a whose can return a recurring
+        // master several times.
+        function mockCalendar(name, writable, events, options) {
+            options = options || {};
+            allEvents = allEvents.concat(events);
+            function record(e) {
+                return { uid: e.uid, summary: e.summary, startDate: new Date(e.start), endDate: new Date(e.end),
+                         alldayEvent: e.allDay === true, recurrence: e.recurrence || "" };
+            }
+            function ref(e) {
+                return { properties: function () { stats.perEventReads++; return record(e); },
+                         uid: function () { return e.uid; } };
+            }
+            var eventsObj = function () { stats.fullListings++; return events.map(ref); };
+            function hits() {
+                var copies = options.copies || 1, list = [];
+                events.forEach(function (e) {
+                    var n = e.recurrence ? copies : 1;
+                    for (var i = 0; i < n; i++) list.push(e);
+                });
+                return list;
+            }
+            eventsObj.whose = function () {
+                stats.searches++;
+                var spec = function () {
+                    if (options.whoseFails) throw new Error("-1726");
+                    return hits().map(ref);
+                };
+                spec.properties = function () { throw new Error("Can't get object."); };
+                spec.uid = function () {
+                    if (options.whoseFails) throw new Error("-1726");
+                    if (options.noUidList) throw new Error("uid list unsupported");
+                    return hits().map(function (e) { return e.uid; });
+                };
+                return spec;
+            };
+            eventsObj.byId = function (id) {
+                var found = allEvents.filter(function (e) { return e.uid === id; });
+                if (found.length === 0) return { properties: function () { throw new Error("no such event"); } };
+                return ref(found[0]);
+            };
+            return { id: options.id, name: function () { return name; }, writable: function () { return writable; }, events: eventsObj };
+        }
+        function mockApp(calendars) {
+            var list = function () { return calendars; };
+            list.name = function () { return calendars.map(function (c) { return c.name(); }); };
+            for (var i = 0; i < calendars.length; i++) list[i] = calendars[i];
+            list.byId = function (id) {
+                var found = calendars.filter(function (c) { return c.id === id; });
+                if (found.length) return found[0];
+                var missing = function () { throw new Error("Can't get object."); };
+                return { name: missing, writable: missing, events: null };
+            };
+            return { calendars: list };
+        }
+        function lookup(app, payload) {
+            try {
+                return findEvent(findCalendars(app, payload), payload).uid();
+            } catch (e) {
+                return "ERROR: " + e.message;
+            }
+        }
+        var standup = { summary: "Standup", start: "2026-11-12T18:00:00Z", end: "2026-11-12T18:30:00Z" };
+        function ev(uid, base) { var e = JSON.parse(JSON.stringify(base)); e.uid = uid; return e; }
+        var payload = { calendarTitle: "Calendar", title: "Standup", isAllDay: false, isSeries: false,
+                        startDate: "2026-11-12T18:00:00Z", endDate: "2026-11-12T18:30:00Z", knownUID: "" };
+        """)
+        return context
+    }
+
+    private func eval(_ context: JSContext, _ script: String) -> JSValue {
+        context.evaluateScript(script)!
+    }
+
+    @Test func sameNamedCalendarsResolveTheUniqueEvent() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        lookup(mockApp([
+            mockCalendar("Calendar", true, []),
+            mockCalendar("Calendar", true, [ev("exchange-1", standup)])
+        ]), payload)
+        """).toString()
+        #expect(uid == "exchange-1")
+    }
+
+    @Test func matchesInTwoCalendarsFailClosed() throws {
+        let context = try makeContext()
+        let result = eval(context, """
+        lookup(mockApp([
+            mockCalendar("Calendar", true, [ev("icloud-1", standup)]),
+            mockCalendar("Calendar", true, [ev("exchange-1", standup)])
+        ]), payload)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+    }
+
+    @Test func readOnlySameNamedCalendarsAreIgnored() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        lookup(mockApp([
+            mockCalendar("Calendar", false, [ev("readonly-1", standup)]),
+            mockCalendar("Calendar", true, [ev("mine-1", standup)])
+        ]), payload)
+        """).toString()
+        #expect(uid == "mine-1")
+    }
+
+    @Test func timedLookupReadsEachCandidateOnce() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        stats.perEventReads = 0;
+        lookup(mockApp([mockCalendar("Calendar", true, [
+            ev("a", { summary: "Standup", start: "2026-11-11T18:00:00Z", end: "2026-11-11T18:30:00Z" }),
+            ev("b", standup),
+            ev("c", { summary: "Standup", start: "2026-11-13T18:00:00Z", end: "2026-11-13T18:30:00Z" })
+        ])]), payload)
+        """).toString()
+        #expect(uid == "b")
+        #expect(eval(context, "stats.perEventReads").toInt32() == 3)
+    }
+
+    @Test func repeatedSeriesMasterIsOneCandidate() throws {
+        let context = try makeContext()
+        // Calendar returned the active "House Cleaning" master 6 times; that
+        // must not look like 6 ambiguous candidates, nor cost 6 reads.
+        let uid = eval(context, """
+        stats.perEventReads = 0;
+        var master = { uid: "m", summary: "Standup", start: "2026-11-02T18:00:00Z", end: "2026-11-02T18:30:00Z", recurrence: "FREQ=WEEKLY;INTERVAL=1" };
+        var p = JSON.parse(JSON.stringify(payload)); p.isSeries = true;
+        lookup(mockApp([mockCalendar("Calendar", true, [master], { copies: 6 })]), p)
+        """).toString()
+        #expect(uid == "m")
+        #expect(eval(context, "stats.perEventReads").toInt32() == 1)
+    }
+
+    @Test func repeatedSeriesMasterIsDedupedOnReferenceFallback() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        var master = { uid: "m", summary: "Standup", start: "2026-11-02T18:00:00Z", end: "2026-11-02T18:30:00Z", recurrence: "FREQ=WEEKLY;INTERVAL=1" };
+        var p = JSON.parse(JSON.stringify(payload)); p.isSeries = true;
+        lookup(mockApp([mockCalendar("Calendar", true, [master], { copies: 6, noUidList: true })]), p)
+        """).toString()
+        #expect(uid == "m")
+    }
+
+    @Test func referenceFallbackWhenUidListFails() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        lookup(mockApp([mockCalendar("Calendar", true, [ev("b", standup)], { noUidList: true })]), payload)
+        """).toString()
+        #expect(uid == "b")
+    }
+
+    @Test func unsearchableCalendarFailsClosedWithoutListingEverything() throws {
+        let context = try makeContext()
+        let result = eval(context, """
+        stats.fullListings = 0;
+        lookup(mockApp([mockCalendar("Calendar", true, [ev("b", standup)], { whoseFails: true })]), payload)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+        #expect(eval(context, "stats.fullListings").toInt32() == 0)
+    }
+
+    @Test func knownUIDResolvesAcrossSameNamedCalendars() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        stats.perEventReads = 0;
+        var p = JSON.parse(JSON.stringify(payload)); p.knownUID = "exchange-1";
+        lookup(mockApp([
+            mockCalendar("Calendar", true, []),
+            mockCalendar("Calendar", true, [ev("exchange-1", standup)])
+        ]), p)
+        """).toString()
+        #expect(uid == "exchange-1")
+        #expect(eval(context, "stats.perEventReads").toInt32() == 1, "only the byId identity check reads an event")
+    }
+
+    @Test func staleKnownUIDFallsBackToScan() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        var p = JSON.parse(JSON.stringify(payload)); p.knownUID = "gone";
+        lookup(mockApp([mockCalendar("Calendar", true, [ev("b", standup)])]), p)
+        """).toString()
+        #expect(uid == "b")
+    }
+
+    @Test func exactCalendarIdDisambiguatesSameNamedCalendars() throws {
+        let context = try makeContext()
+        // Identical events on two same-named calendars are ambiguous by name,
+        // but EventKit's calendarIdentifier selects exactly one calendar.
+        let uid = eval(context, """
+        var p = JSON.parse(JSON.stringify(payload)); p.calendarIdentifier = "CAL-B";
+        lookup(mockApp([
+            mockCalendar("Calendar", true, [ev("icloud-1", standup)], { id: "CAL-A" }),
+            mockCalendar("Calendar", true, [ev("exchange-1", standup)], { id: "CAL-B" })
+        ]), p)
+        """).toString()
+        #expect(uid == "exchange-1")
+    }
+
+    @Test func exactCalendarThatIsReadOnlyFailsClosed() throws {
+        let context = try makeContext()
+        // Must not widen to the other, writable same-named calendar.
+        let result = eval(context, """
+        var p = JSON.parse(JSON.stringify(payload)); p.calendarIdentifier = "CAL-A";
+        lookup(mockApp([
+            mockCalendar("Calendar", false, [ev("readonly-1", standup)], { id: "CAL-A" }),
+            mockCalendar("Calendar", true, [ev("mine-1", standup)], { id: "CAL-B" })
+        ]), p)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+    }
+
+    @Test func exactCalendarWithDifferentTitleFailsClosed() throws {
+        let context = try makeContext()
+        let result = eval(context, """
+        var p = JSON.parse(JSON.stringify(payload)); p.calendarIdentifier = "CAL-A";
+        lookup(mockApp([
+            mockCalendar("Renamed", true, [ev("a", standup)], { id: "CAL-A" }),
+            mockCalendar("Calendar", true, [ev("b", standup)], { id: "CAL-B" })
+        ]), p)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+    }
+
+    @Test func unresolvableCalendarIdFallsBackToName() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        var p = JSON.parse(JSON.stringify(payload)); p.calendarIdentifier = "EXCHANGE-STYLE-ID";
+        lookup(mockApp([mockCalendar("Calendar", true, [ev("b", standup)], { id: "CAL-B" })]), p)
+        """).toString()
+        #expect(uid == "b")
+    }
+
+    @Test func externalIdentifierSkipsTheSearch() throws {
+        let context = try makeContext()
+        let uid = eval(context, """
+        stats.searches = 0; stats.perEventReads = 0;
+        var p = JSON.parse(JSON.stringify(payload)); p.calendarIdentifier = "CAL-B"; p.externalIdentifier = "b";
+        lookup(mockApp([mockCalendar("Calendar", true, [ev("a", { summary: "Standup", start: "2026-11-11T18:00:00Z", end: "2026-11-11T18:30:00Z" }), ev("b", standup)], { id: "CAL-B" })]), p)
+        """).toString()
+        #expect(uid == "b")
+        #expect(eval(context, "stats.searches").toInt32() == 0)
+        #expect(eval(context, "stats.perEventReads").toInt32() == 1)
+    }
+
+    @Test func externalIdentifierForAnotherEventFallsBackToSearch() throws {
+        let context = try makeContext()
+        // The id resolves, but to an event that fails the identity check.
+        let uid = eval(context, """
+        stats.searches = 0;
+        var p = JSON.parse(JSON.stringify(payload)); p.externalIdentifier = "a";
+        lookup(mockApp([mockCalendar("Calendar", true, [ev("a", { summary: "Other", start: "2026-11-12T18:00:00Z", end: "2026-11-12T18:30:00Z" }), ev("b", standup)])]), p)
+        """).toString()
+        #expect(uid == "b")
+        #expect(eval(context, "stats.searches").toInt32() > 0)
+    }
+
+    @Test func detachedOccurrenceIdentifierTargetsTheSeriesMaster() throws {
+        let context = try makeContext()
+        // The mock knows only the master id; a lookup of the raw "/RID=" id
+        // would miss and force a search, so zero searches proves the suffix
+        // was dropped and the master was resolved.
+        let uid = eval(context, """
+        stats.searches = 0;
+        var master = { uid: "m", summary: "Standup", start: "2026-11-02T18:00:00Z", end: "2026-11-02T18:30:00Z", recurrence: "FREQ=WEEKLY;INTERVAL=1" };
+        var p = JSON.parse(JSON.stringify(payload)); p.isSeries = true; p.externalIdentifier = "m/RID=814827600";
+        lookup(mockApp([mockCalendar("Calendar", true, [master])]), p)
+        """).toString()
+        #expect(uid == "m")
+        #expect(eval(context, "stats.searches").toInt32() == 0)
+        #expect(eval(context, "seriesExternalIdentifier('abc')").toString() == "abc")
+    }
+
+    @Test func movedDetachedOccurrenceFailsClosedWithoutSearching() throws {
+        let context = try makeContext()
+        // The occurrence was moved off the series' time; a decoy series with
+        // the same title at the new time must not be picked by a search.
+        let result = eval(context, """
+        stats.searches = 0;
+        var master = { uid: "m", summary: "Standup", start: "2026-11-02T18:00:00Z", end: "2026-11-02T18:30:00Z", recurrence: "FREQ=WEEKLY;INTERVAL=1" };
+        var decoy = { uid: "d", summary: "Standup", start: "2026-11-01T20:30:00Z", end: "2026-11-01T21:00:00Z", recurrence: "FREQ=WEEKLY;INTERVAL=1" };
+        var p = JSON.parse(JSON.stringify(payload)); p.isSeries = true; p.externalIdentifier = "m/RID=1";
+        p.startDate = "2026-11-12T20:30:00Z"; p.endDate = "2026-11-12T21:00:00Z";
+        lookup(mockApp([mockCalendar("Calendar", true, [master, decoy])]), p)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+        #expect(eval(context, "stats.searches").toInt32() == 0)
+    }
+}
+
+/// Apple event errors surface as actionable messages instead of raw text.
+@Suite("Automation error classification")
+struct AutomationErrorTests {
+
+    @Test func commonAppleEventErrorsMapToActionableErrors() {
+        #expect(CalendarAutomation.classify(errorNumber: -1743) == .notAuthorized)
+        #expect(CalendarAutomation.classify(errorNumber: -1744) == .notAuthorized)
+        #expect(CalendarAutomation.classify(errorNumber: -1712) == .calendarTimedOut)
+        #expect(CalendarAutomation.classify(errorNumber: -600) == .calendarUnavailable)
+        #expect(CalendarAutomation.classify(errorNumber: -609) == .calendarUnavailable)
+        #expect(CalendarAutomation.classify(errorNumber: -1728) == nil)
+        #expect(CalendarAutomation.classify(errorNumber: nil) == nil)
+    }
+
+    @Test func errorNumberIsReadFromOsascriptStderr() {
+        let stderr = "/Applications/Roster.app/Contents/Resources/CalendarRoster.js: execution error: Error: Not authorized to send Apple events to Calendar. (-1743)"
+        #expect(CalendarAutomation.errorNumber(inStderr: stderr) == -1743)
+        #expect(CalendarAutomation.errorNumber(inStderr: "some warning without a code") == nil)
+    }
+
+    @Test func notAuthorizedMessagePointsToSystemSettings() {
+        let message = CalendarAutomationError.notAuthorized.errorDescription ?? ""
+        #expect(message.contains("Automation"))
+        #expect(message.contains("no invitees were added"))
+    }
+
+    @Test func scriptReportsErrorNumberInOutput() throws {
+        let url = try #require(Bundle.main.url(forResource: "CalendarRoster", withExtension: "js"))
+        let context = JSContext()!
+        context.evaluateScript(try String(contentsOf: url, encoding: .utf8))
+        let json = context.evaluateScript(#"output("error", { message: "Not authorized", errorNumber: -1743 })"#)!.toString()!
+        let decoded = try JSONDecoder().decode(ScriptOutput.self, from: Data(json.utf8))
+        #expect(decoded.errorNumber == -1743)
+        let plain = context.evaluateScript(#"output("error", { message: "x" })"#)!.toString()!
+        #expect(try JSONDecoder().decode(ScriptOutput.self, from: Data(plain.utf8)).errorNumber == nil)
     }
 }

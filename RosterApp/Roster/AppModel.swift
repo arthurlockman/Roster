@@ -21,9 +21,15 @@ final class AppModel {
         case applying(Review)
     }
     private(set) var flow: Flow = .idle
-    /// Background read-only locate run feeding the fast apply; the result is
-    /// dropped unless the same review is still on screen.
-    private var locateTask: Task<Void, Never>?
+    /// Background read-only locate run feeding the fast apply. Its value is
+    /// the Calendar-scripting uid (nil if locate failed). Cancelling it
+    /// terminates the osascript process, so an abandoned review never leaves
+    /// a scan running for later requests to queue behind.
+    private var locateTask: Task<String?, Never>?
+    /// How long confirm waits for an unfinished locate before cancelling it
+    /// and letting apply scan on its own. Waiting is usually cheaper: the
+    /// locate is already part-way through the same scan apply would do.
+    private static let locateWaitLimit: Duration = .seconds(30)
     /// Set when a drop found nothing to add.
     private(set) var allPresentEvent: EventSnapshot?
     /// One-shot summary of an apply attempt (success, partial, or error).
@@ -112,6 +118,9 @@ final class AppModel {
 
     func requestPermissions() async {
         await calendarService.requestAccess()
+        if calendarService.accessState == .authorized {
+            automation.warmUpCalendarApp()
+        }
         await contactsService.requestAccess()
     }
     /// Entry point for a drop of `rosterID` onto `event`. Drops on targets we
@@ -135,6 +144,7 @@ final class AppModel {
             flow = .idle
             return
         }
+        cancelLocate()
         flow = .previewing(event: event, rosterID: rosterID)
         Task {
             do {
@@ -170,12 +180,9 @@ final class AppModel {
                     // lets confirm write through byId in seconds. A stale or
                     // failed locate is harmless: apply verifies the uid and
                     // falls back to its own scan.
+                    let automation = automation
                     locateTask = Task {
-                        guard let uid = try? await automation.locate(event: event) else { return }
-                        if case .reviewing(let current) = flow,
-                           current.rosterID == rosterID, current.event == event, current.locatedUID == nil {
-                            flow = .reviewing(current.withLocatedUID(uid))
-                        }
+                        (try? await automation.locate(event: event)) ?? nil
                     }
                 }
             } catch {
@@ -189,12 +196,43 @@ final class AppModel {
         // No write ever happens on cancel or dismissal.
         if case .applying = flow { return } // Never cancel mid-apply.
         if case .previewing = flow { return } // Preview is read-only; it publishes its own result.
+        cancelLocate()
         flow = .idle
+    }
+
+    private func cancelLocate() {
+        locateTask?.cancel()
+        locateTask = nil
+    }
+
+    /// The located uid for `review`: already known, or the in-flight locate's
+    /// result. Waits at most `locateWaitLimit`; past that the locate is
+    /// cancelled (terminating its process) so apply never runs concurrently
+    /// with it inside Calendar.app.
+    private func locatedUID(for review: Review) async -> String? {
+        if let uid = review.locatedUID { return uid }
+        guard let task = locateTask else { return nil }
+        enum Outcome: Sendable { case located(String?), timedOut }
+        let limit = Self.locateWaitLimit
+        let outcome = await withTaskGroup(of: Outcome.self) { group in
+            group.addTask { .located(await task.value) }
+            group.addTask {
+                try? await Task.sleep(for: limit)
+                return .timedOut
+            }
+            let first = await group.next() ?? .timedOut
+            if case .timedOut = first { task.cancel() }
+            group.cancelAll()
+            return first
+        }
+        if case .located(let uid) = outcome { return uid }
+        return nil
     }
 
     func confirmReview() {
         guard case .reviewing(let review) = flow else { return }
         guard let roster = rosterStore.rosters.first(where: { $0.id == review.rosterID }) else {
+            cancelLocate()
             flow = .idle
             alertMessage = "That roster was deleted; nothing was added."
             return
@@ -207,17 +245,27 @@ final class AppModel {
         flow = .applying(review)
         Task {
             do {
-                let result = try await automation.apply(review: review)
+                var review = review
+                if let uid = await locatedUID(for: review) {
+                    review = review.withLocatedUID(uid)
+                }
+                let event = review.event
+                let calendarService = calendarService
+                let result = try await automation.apply(review: review) {
+                    calendarService.attendeeEmails(forEventIdentifier: event.eventIdentifier)
+                }
                 switch result {
                 case .changed(let fresh):
                     flow = .reviewing(fresh)
                     alertMessage = "The event changed since the last review. Please review the missing invitees again."
                 case .finished(let added, let remaining, let warning):
+                    cancelLocate()
                     flow = .idle
                     resultMessage = Self.describe(added: added, remaining: remaining, warning: warning)
                     await calendarService.refresh()
                 }
             } catch {
+                cancelLocate()
                 flow = .idle
                 alertMessage = error.localizedDescription
             }

@@ -5,17 +5,24 @@
 // attendees are appended, never removed or modified, and no RSVP is made.
 // The fast preview path lives in the app (EventKit); this script still backs
 // the preview when EventKit cannot read the attendee list, and always backs
-// the write, so its reads are batched: candidate properties arrive in one
-// Apple event and attendee emails in one Apple event, with per-object reads
-// kept only as fallbacks.
-// Identity rule (amended): Calendar's scripting calendarIdentifier proved
-// unreadable on current macOS builds and scripting uids do not equal any
-// EventKit identifier, so the event is matched conservatively by
-//   writable calendar with exactly the payload calendar title (exactly one)
-//   + exact title + exact start/end instants (Y/M-D for all-day)
+// the write, so its reads are batched where Calendar allows it: candidate
+// uids arrive in one Apple event (then one read per unique candidate; see
+// matchesInSpecifier) and attendee emails in one Apple event.
+// Identity rule: the calendar is the one whose scripting id equals
+// EventKit's calendarIdentifier (measured identical on iCloud, subscribed
+// and Birthdays calendars); it must be writable and carry the payload title.
+// Only when Calendar cannot resolve that id does the lookup fall back to
+// every writable calendar with exactly the payload calendar title. The
+// event is tried first by id — Calendar's byId accepts EventKit's
+// calendarItemExternalIdentifier (the iCalendar UID) as well as its own
+// uid, and rejects unknown ids — and otherwise matched
+// conservatively, with exactly one matching event across those calendars,
+// by
+//   exact title + exact start/end instants (Y/M-D for all-day)
 //   + all-day flag,
 // and for a recurring-series target the unique recurring master with the same
-// title and wall-clock time whose anchor precedes the occurrence. Anything
+// title and wall-clock time whose anchor precedes the occurrence and whose
+// recurrence (if UNTIL-bounded) has not ended before it. Anything
 // ambiguous fails closed; the user confirms title and date in the review
 // dialog before any write.
 //
@@ -88,8 +95,23 @@ function sameHMS(a, b) {
     return a.getHours() === b.getHours() && a.getMinutes() === b.getMinutes() && a.getSeconds() === b.getSeconds();
 }
 
+// The UNTIL bound of an RRULE-style recurrence string, or null when the
+// rule has none (open-ended or COUNT-bounded). RFC 5545 forms:
+//   UNTIL=20261001T065959Z  (UTC instant)
+//   UNTIL=20261001T235959   (local wall-clock)
+//   UNTIL=20261001          (date only; inclusive, so end of that local day)
+function recurrenceUntil(rule) {
+    if (typeof rule !== "string") return null;
+    var m = /(?:^|;)\s*UNTIL=(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})(Z)?)?/i.exec(rule);
+    if (!m) return null;
+    var y = +m[1], mo = +m[2] - 1, d = +m[3];
+    if (m[4] === undefined) return new Date(y, mo, d, 23, 59, 59, 999);
+    if (m[7]) return new Date(Date.UTC(y, mo, d, +m[4], +m[5], +m[6]));
+    return new Date(y, mo, d, +m[4], +m[5], +m[6]);
+}
+
 // A candidate meta is plain data read from one scripting event:
-// { summary, allDay, start: Date, end: Date, hasRecurrence }.
+// { summary, allDay, start: Date, end: Date, hasRecurrence, recurrence }.
 // Returns the indices of all candidates matching the payload identity.
 // The caller must require exactly one match; anything else fails closed.
 function matchCandidates(candidates, payload) {
@@ -105,6 +127,12 @@ function matchCandidates(candidates, payload) {
             if (!candidate.hasRecurrence) return;
             if (candidate.start.getTime() > payloadStart.getTime()) return;
             if (!sameHMS(candidate.start, payloadStart)) return;
+            // A master whose recurrence ended before the occurrence cannot
+            // own it. This disambiguates "this and future events" splits,
+            // which leave an UNTIL-bounded old master with the same title
+            // and time next to the new one.
+            var until = recurrenceUntil(candidate.recurrence);
+            if (until !== null && until.getTime() < payloadStart.getTime()) return;
         } else if (payload.isAllDay) {
             if (!sameYMD(candidate.start, payloadStart)) return;
             if (!sameYMD(candidate.end, payloadEnd)) return;
@@ -153,17 +181,38 @@ function validatePayload(payload) {
     if (isNaN(new Date(payload.startDate).getTime()) || isNaN(new Date(payload.endDate).getTime())) {
         throw new Error("Invalid payload: startDate/endDate must be ISO-8601");
     }
-    if (typeof payload.knownUID !== "undefined" && typeof payload.knownUID !== "string") {
-        throw new Error("Invalid payload: knownUID must be a string");
-    }
+    ["knownUID", "calendarIdentifier", "externalIdentifier"].forEach(function (key) {
+        if (typeof payload[key] !== "undefined" && typeof payload[key] !== "string") {
+            throw new Error("Invalid payload: " + key + " must be a string");
+        }
+    });
 }
 
 // ---- Calendar access ----------------------------------------------------
 
-// Exactly one writable calendar with exactly the payload calendar title.
-// Names arrive in one Apple event; only same-named candidates (rarely more
-// than one) pay a per-calendar writable check.
-function findCalendar(Calendar, payload) {
+// Every writable calendar with exactly the payload calendar title. Several
+// accounts commonly share a name ("Calendar" on iCloud and Exchange), so
+// this returns all of them and findEvent requires exactly one matching
+// event across the set. Names arrive in one Apple event; only same-named
+// candidates pay a per-calendar writable check.
+function findCalendars(Calendar, payload) {
+    // Exact path: EventKit's calendarIdentifier is the scripting id. If it
+    // resolves, it is the only candidate — a read-only or renamed match
+    // fails closed rather than widening to other same-named calendars.
+    if (typeof payload.calendarIdentifier === "string" && payload.calendarIdentifier.length > 0) {
+        var exact = Calendar.calendars.byId(payload.calendarIdentifier);
+        var exactName = null;
+        try { exactName = exact.name(); } catch (e0) { exactName = null; }
+        if (exactName !== null) {
+            var exactWritable = null;
+            try { exactWritable = exact.writable(); } catch (e1) { exactWritable = null; }
+            if (exactName !== payload.calendarTitle || exactWritable !== true) {
+                throw new Error(IDENTITY_MISMATCH_MESSAGE);
+            }
+            return [exact];
+        }
+        // Unresolvable id (account type where the ids differ): fall back.
+    }
     var matches = [];
     var names = null;
     try { names = Calendar.calendars.name(); } catch (e) { names = null; }
@@ -184,13 +233,11 @@ function findCalendar(Calendar, payload) {
             if (name === payload.calendarTitle && writable2 === true) matches.push(all[j]);
         }
     }
-    if (matches.length !== 1) throw new Error(IDENTITY_MISMATCH_MESSAGE);
-    return matches[0];
+    if (matches.length === 0) throw new Error(IDENTITY_MISMATCH_MESSAGE);
+    return matches;
 }
 
-// Plain-data meta from one event's properties record. Shared by the bulk
-// fast path (properties fetched in one Apple event) and the per-candidate
-// fallback.
+// Plain-data meta from one event's properties record.
 function metaFromProperties(properties) {
     if (!properties) return null;
     var start = properties.startDate;
@@ -202,7 +249,9 @@ function metaFromProperties(properties) {
         allDay: properties.alldayEvent === true,
         start: start,
         end: end,
-        hasRecurrence: typeof recurrence === "string" && recurrence.length > 0
+        hasRecurrence: typeof recurrence === "string" && recurrence.length > 0,
+        recurrence: typeof recurrence === "string" ? recurrence : null,
+        uid: typeof properties.uid === "string" ? properties.uid : null
     };
 }
 
@@ -214,66 +263,161 @@ function candidateMeta(event) {
     return metaFromProperties(properties);
 }
 
-// Exactly one event in the calendar matching the payload identity.
+// Matching events for one `whose` specifier.
 //
-// Fast path: `knownUID` was captured by a read-only locate run earlier in
-// this flow. byId resolves in milliseconds while a whose scan costs
-// seconds-to-minutes on large calendars, so apply should almost always take
-// the fast path. The identity check still runs on the byId-resolved event,
-// so a stale or wrong uid can only cost the fallback scan — never a wrong
-// write.
+// Measured against Calendar.app on macOS 26: every evaluation of a `whose`
+// specifier costs a full calendar scan (~10-30 s on a calendar with years of
+// history), each per-event properties read costs ~0.5 s, and a bulk
+// `properties()` on a specifier is unsupported (-1728). A `whose` also
+// returns a recurring master once per stored occurrence/exception, so a
+// series can appear dozens of times; counting those copies as separate
+// candidates made every such series look ambiguous.
 //
-// Non-series payloads match by exact instants, so the scan can be
+// So: one evaluation fetching just the uids, dedupe, then one byId read per
+// unique event. If the uid list cannot be read, fall back to references
+// read one at a time, deduplicated by the uid in each properties record.
+// Throws when Calendar cannot evaluate the specifier at all.
+function matchesInSpecifier(calendar, specifier, payload) {
+    var uids = null;
+    try { uids = specifier.uid(); } catch (e) { uids = null; }
+    if (uids) {
+        var unique = [];
+        var seen = {};
+        var complete = true;
+        for (var i = 0; i < uids.length; i++) {
+            var uid = uids[i];
+            if (typeof uid !== "string" || uid.length === 0) { complete = false; break; }
+            if (seen[uid]) continue;
+            seen[uid] = true;
+            unique.push(uid);
+        }
+        if (complete) {
+            var metas = [];
+            var events = [];
+            for (var j = 0; j < unique.length; j++) {
+                var event = calendar.events.byId(unique[j]);
+                var meta = candidateMeta(event);
+                if (meta !== null) {
+                    metas.push(meta);
+                    events.push(event);
+                }
+            }
+            return matchCandidates(metas, payload).map(function (index) { return events[index]; });
+        }
+    }
+    var candidates = specifier();
+    var perMetas = [];
+    var perEvents = [];
+    var seenUIDs = {};
+    for (var k = 0; k < candidates.length; k++) {
+        var candidate = candidateMeta(candidates[k]);
+        if (candidate === null) continue;
+        if (typeof candidate.uid === "string" && candidate.uid.length > 0) {
+            if (seenUIDs[candidate.uid]) continue;
+            seenUIDs[candidate.uid] = true;
+        }
+        perMetas.push(candidate);
+        perEvents.push(candidates[k]);
+    }
+    return matchCandidates(perMetas, payload).map(function (index) { return perEvents[index]; });
+}
+
+// All events in one calendar matching the payload identity.
+//
+// Non-series payloads match by exact instants, so the scan is first
 // date-windowed server-side: Calendar returns a handful of candidates even
 // in a calendar with years of history. Calendar's whose evaluator rejects
 // _greaterThanOrEquals/_lessThanOrEquals on dates (-1726) but accepts strict
 // _greaterThan/_lessThan, so the bounds are widened instead. Series targets
-// are recurring masters whose anchor can be arbitrarily old — those keep the
-// title-only scan.
-function findEvent(calendar, payload) {
-    if (typeof payload.knownUID === "string" && payload.knownUID.length > 0) {
-        var cached = null;
-        try { cached = calendar.events.byId(payload.knownUID); } catch (e) { cached = null; }
-        if (cached) {
-            var cachedMeta = null;
-            try { cachedMeta = candidateMeta(cached); } catch (e2) { cachedMeta = null; }
-            if (cachedMeta !== null && matchCandidates([cachedMeta], payload).length === 1) {
-                return cached;
-            }
-        }
-        // Stale or wrong uid: fall through to the full conservative match.
-    }
-
-    var conditions = [{ summary: { _equals: payload.title } }];
+// are recurring masters whose anchor can be arbitrarily old, so they use
+// the title-only scan (also the windowed scan's fallback). If Calendar
+// cannot evaluate either, this fails closed rather than reading every event
+// in the calendar one Apple event at a time.
+function scanCalendar(calendar, payload) {
+    var titleOnly = { summary: { _equals: payload.title } };
+    var specifiers = [];
     if (!payload.isSeries) {
         var payloadStart = new Date(payload.startDate);
         var lo = new Date(payloadStart.getTime() - 3 * 86400000);
         var hi = new Date(payloadStart.getTime() + 3 * 86400000);
-        conditions.push({ startDate: { _greaterThan: lo } });
-        conditions.push({ startDate: { _lessThan: hi } });
+        specifiers.push(calendar.events.whose({ _and: [
+            titleOnly,
+            { startDate: { _greaterThan: lo } },
+            { startDate: { _lessThan: hi } }
+        ] }));
     }
-    var candidates;
-    try {
-        candidates = calendar.events.whose({ _and: conditions })();
-    } catch (e3) {
+    specifiers.push(calendar.events.whose(titleOnly));
+    for (var i = 0; i < specifiers.length; i++) {
         try {
-            candidates = calendar.events.whose({ summary: { _equals: payload.title } })();
-        } catch (e4) {
-            candidates = calendar.events();
+            return matchesInSpecifier(calendar, specifiers[i], payload);
+        } catch (e) {
+            // Try the next, broader specifier.
         }
     }
-    var metas = [];
-    var events = [];
-    for (var i = 0; i < candidates.length; i++) {
-        var meta = candidateMeta(candidates[i]);
-        if (meta !== null) {
-            metas.push(meta);
-            events.push(candidates[i]);
+    throw new Error(IDENTITY_MISMATCH_MESSAGE);
+}
+
+// EventKit gives a detached (individually edited) occurrence the external
+// identifier "<series uid>/RID=<n>", and Calendar's byId resolves that to
+// the single occurrence. Roster only ever writes to the whole series, so the
+// suffix is dropped and the id resolves to the series master instead.
+function isDetachedIdentifier(identifier) {
+    return typeof identifier === "string" && identifier.indexOf("/RID=") >= 0;
+}
+
+function seriesExternalIdentifier(identifier) {
+    if (typeof identifier !== "string") return identifier;
+    var index = identifier.indexOf("/RID=");
+    return index >= 0 ? identifier.slice(0, index) : identifier;
+}
+
+// Exactly one event across the candidate calendars matching the payload
+// identity.
+//
+// Fast path: `knownUID` was captured by a read-only locate run earlier in
+// this flow, which already required exactly one match across the
+// candidate calendars; `externalIdentifier` comes from EventKit. byId resolves in milliseconds while a whose scan
+// costs tens of seconds on large calendars. Calendar resolves event ids
+// globally — `calendars[a].events.byId(uid)` returns the event even when it
+// lives in calendar b, and Calendar's own whose results are addressed the
+// same way — so the uid is resolved once, not per calendar (per-calendar
+// lookups made one event look like several and forced the slow scan). The
+// identity check still runs on the resolved event, so a stale or wrong uid
+// can only cost the fallback scan — never a wrong write.
+function findEvent(calendars, payload) {
+    // knownUID (from a locate run) first, then EventKit's external
+    // identifier (the iCalendar UID), which Calendar's byId also accepts.
+    var tried = {};
+    var uids = [payload.knownUID, seriesExternalIdentifier(payload.externalIdentifier)];
+    for (var u = 0; u < uids.length; u++) {
+        var uid = uids[u];
+        if (typeof uid !== "string" || uid.length === 0 || tried[uid]) continue;
+        tried[uid] = true;
+        var cached = null;
+        try { cached = calendars[0].events.byId(uid); } catch (e) { cached = null; }
+        if (!cached) continue;
+        var cachedMeta = null;
+        try { cachedMeta = candidateMeta(cached); } catch (e2) { cachedMeta = null; }
+        if (cachedMeta !== null && matchCandidates([cachedMeta], payload).length === 1) {
+            return cached;
+        }
+        if (cachedMeta !== null && uid !== payload.knownUID && isDetachedIdentifier(payload.externalIdentifier)) {
+            // The edited occurrence's own series master does not match it
+            // (typically: the occurrence was moved to another time). A search
+            // could only find some other series with the same title and
+            // time, so fail closed now instead of after a long scan.
+            throw new Error(IDENTITY_MISMATCH_MESSAGE);
         }
     }
-    var matches = matchCandidates(metas, payload);
+    // No usable uid: fall through to the full conservative match.
+
+    var matches = [];
+    for (var i = 0; i < calendars.length; i++) {
+        matches = matches.concat(scanCalendar(calendars[i], payload));
+        if (matches.length > 1) break;
+    }
     if (matches.length !== 1) throw new Error(IDENTITY_MISMATCH_MESSAGE);
-    return events[matches[0]];
+    return matches[0];
 }
 
 function seriesFlag(event) {
@@ -316,6 +460,9 @@ function output(status, fields) {
         remainingEmails: fields.remainingEmails || [],
         warning: fields.warning === undefined ? null : fields.warning,
         message: fields.message === undefined ? null : fields.message,
+        // Apple event error number (e.g. -1743 not authorized, -1712
+        // timeout) so the app can explain the failure without parsing text.
+        errorNumber: typeof fields.errorNumber === "number" ? fields.errorNumber : null,
         uid: fields.uid || ""
     };
     return JSON.stringify(result);
@@ -331,8 +478,7 @@ function run(argv) {
         // Deferred so pure helpers above can be exercised without Calendar.
         var Calendar = Application("Calendar");
 
-        var calendar = findCalendar(Calendar, payload);
-        var event = findEvent(calendar, payload);
+        var event = findEvent(findCalendars(Calendar, payload), payload);
 
         var isSeries = seriesFlag(event);
 
@@ -387,14 +533,10 @@ function run(argv) {
             }
         }
 
-        var warning = null;
-        if (appendError === null) {
-            try {
-                Calendar.reloadCalendars();
-            } catch (e) {
-                warning = "Calendar may not have refreshed its views: " + String(e.message || e);
-            }
-        }
+        // No reloadCalendars here: the additions are committed by the push
+        // itself and synced by the account. A/B testing on real drops showed
+        // the same result and invite delivery without it, and it refreshed
+        // every account in Calendar.
 
         var afterEmails = null;
         try {
@@ -410,7 +552,7 @@ function run(argv) {
                     warning: appendError
                 });
             }
-            return output("error", { message: UNCONFIRMED_MESSAGE, warning: warning });
+            return output("error", { message: UNCONFIRMED_MESSAGE });
         }
 
         var added = [];
@@ -432,10 +574,7 @@ function run(argv) {
             });
         }
 
-        var finishWarning = warning;
-        if (remaining.length > 0 && finishWarning === null) {
-            finishWarning = "Some addresses were not confirmed as added.";
-        }
+        var finishWarning = remaining.length > 0 ? "Some addresses were not confirmed as added." : null;
         return output("finished", {
             attendeeEmails: afterEmails,
             addedEmails: added,
@@ -443,6 +582,6 @@ function run(argv) {
             warning: finishWarning
         });
     } catch (e) {
-        return output("error", { message: String(e.message || e) });
+        return output("error", { message: String(e.message || e), errorNumber: e.errorNumber });
     }
 }

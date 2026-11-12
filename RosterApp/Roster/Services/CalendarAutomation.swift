@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 /// The only attendee-mutation path: a background `osascript` process talking
@@ -10,6 +11,12 @@ nonisolated enum CalendarAutomationError: LocalizedError, Equatable {
     case invalidOutput(String)
     case alreadyRunning
     case payloadEncodingFailed
+    /// Automation → Calendar is denied (or still needs consent).
+    case notAuthorized
+    /// Calendar did not answer in time (Apple event timeout or our watchdog).
+    case calendarTimedOut
+    /// Calendar quit or the connection to it broke mid-run.
+    case calendarUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -27,6 +34,12 @@ nonisolated enum CalendarAutomationError: LocalizedError, Equatable {
             return "Another calendar update is already running."
         case .payloadEncodingFailed:
             return "Could not encode the automation request."
+        case .notAuthorized:
+            return "Roster isn't allowed to control Calendar, so no invitees were added. Turn on Calendar under Roster in System Settings › Privacy & Security › Automation, then try again."
+        case .calendarTimedOut:
+            return "Calendar didn't respond in time. If it's busy syncing, wait a moment and try again."
+        case .calendarUnavailable:
+            return "Roster lost its connection to Calendar. Open Calendar and try again."
         }
     }
 }
@@ -78,6 +91,8 @@ nonisolated struct ScriptOutput: Decodable, Equatable {
     let remainingEmails: [String]?
     let warning: String?
     let message: String?
+    /// Apple event error number behind a script "error" status, if any.
+    let errorNumber: Int?
     /// Calendar-scripting uid, returned by the locate mode.
     let uid: String?
 }
@@ -155,7 +170,10 @@ final class CalendarAutomation {
         return uid.isEmpty ? nil : uid
     }
 
-    func apply(review: Review) async throws -> ApplyResult {
+    /// `currentAttendees` reads the event's attendee emails in-process
+    /// (EventKit); it is only used for read-only verification after an apply
+    /// attempt went wrong, and may return nil when the list is unknown.
+    func apply(review: Review, currentAttendees: @MainActor () -> [String]? = { nil }) async throws -> ApplyResult {
         guard !busy else { throw CalendarAutomationError.alreadyRunning }
         busy = true
         defer { busy = false }
@@ -188,7 +206,7 @@ final class CalendarAutomation {
             case "error":
                 // The subprocess already attempted (and partially performed) a
                 // write it could not complete cleanly. Follow up read-only.
-                return try await recoverAfterFailedApply(review: review)
+                return try await recoverAfterFailedApply(review: review, currentAttendees: currentAttendees)
             default:
                 throw CalendarAutomationError.invalidOutput("apply returned status \(output.status)")
             }
@@ -197,8 +215,9 @@ final class CalendarAutomation {
             // uncertain partial writes: exactly one read-only preview, never a
             // second write.
             switch transport {
-            case .scriptFailed, .invalidOutput, .scriptUnavailable, .unconfirmed:
-                return try await recoverAfterFailedApply(review: review)
+            case .scriptFailed, .invalidOutput, .scriptUnavailable, .unconfirmed,
+                 .calendarTimedOut, .calendarUnavailable:
+                return try await recoverAfterFailedApply(review: review, currentAttendees: currentAttendees)
             default:
                 throw transport
             }
@@ -207,26 +226,97 @@ final class CalendarAutomation {
 
     // MARK: - Failure recovery (read-only)
 
-    /// After an apply attempt went wrong, run one preview and report what is
-    /// actually on the event now. This never writes.
-    private func recoverAfterFailedApply(review: Review) async throws -> ApplyResult {
+    /// After an apply attempt went wrong, report what is actually on the
+    /// event now. This never writes. EventKit answers in-process first, so a
+    /// Calendar.app that just timed out is not asked to rescan; only when
+    /// EventKit cannot confirm every reviewed address does one script preview
+    /// run, resolving the event by its located uid when known.
+    private func recoverAfterFailedApply(review: Review, currentAttendees: @MainActor () -> [String]?) async throws -> ApplyResult {
+        func split(_ emails: [String]) -> (added: [String], remaining: [String]) {
+            let present = Set(emails.compactMap(normalizedEmailKey))
+            var added: [String] = []
+            var remaining: [String] = []
+            for key in review.missingKeys {
+                if present.contains(key) { added.append(key) } else { remaining.append(key) }
+            }
+            return (added, remaining)
+        }
+
+        let eventKitEmails = currentAttendees()
+        if let eventKitEmails {
+            let result = split(eventKitEmails)
+            if result.remaining.isEmpty {
+                return .finished(
+                    added: result.added,
+                    remaining: [],
+                    warning: "Calendar automation reported a problem, but every invitee is now on the event."
+                )
+            }
+        }
+
         let previewPayload = try makePayload(
             mode: "preview",
             event: review.event,
             requiredEmails: review.required.map(\.email),
             reviewedMissingKeys: [],
-            knownUID: ""
+            knownUID: review.locatedUID ?? ""
         )
-        guard let output = try? await execute(payload: previewPayload), output.status == "preview" else {
-            throw CalendarAutomationError.unconfirmed
+        if let output = try? await execute(payload: previewPayload), output.status == "preview" {
+            let result = split(output.attendeeEmails ?? [])
+            return .finished(added: result.added, remaining: result.remaining, warning: CalendarAutomationError.unconfirmed.errorDescription)
         }
-        let attendees = Set((output.attendeeEmails ?? []).compactMap(normalizedEmailKey))
-        var added: [String] = []
-        var remaining: [String] = []
-        for key in review.missingKeys {
-            if attendees.contains(key) { added.append(key) } else { remaining.append(key) }
+        if let eventKitEmails {
+            // EventKit may lag a write Calendar just made, so its "still
+            // missing" is reported as unconfirmed, never as a definite miss.
+            let result = split(eventKitEmails)
+            return .finished(added: result.added, remaining: result.remaining, warning: CalendarAutomationError.unconfirmed.errorDescription)
         }
-        return .finished(added: added, remaining: remaining, warning: CalendarAutomationError.unconfirmed.errorDescription)
+        throw CalendarAutomationError.unconfirmed
+    }
+
+    // MARK: - Error classification
+
+    /// Maps the Apple event errors users actually hit to actionable errors;
+    /// nil means "no specific advice", and callers keep their generic error.
+    nonisolated static func classify(errorNumber: Int?) -> CalendarAutomationError? {
+        switch errorNumber {
+        case -1743, -1744: // errAEEventNotPermitted, errAEEventWouldRequireUserConsent
+            return .notAuthorized
+        case -1712: // errAETimeout
+            return .calendarTimedOut
+        case -600, -609, -903: // procNotFound, connectionInvalid, noPortErr
+            return .calendarUnavailable
+        default:
+            return nil
+        }
+    }
+
+    /// osascript reports errors that escape the script as
+    /// "…: execution error: <message> (-1743)"; this pulls out the number.
+    nonisolated static func errorNumber(inStderr stderr: String) -> Int? {
+        guard let match = stderr.firstMatch(of: /\((-\d+)\)\s*$/) else { return nil }
+        return Int(match.1)
+    }
+
+    // MARK: - Calendar warm-up
+
+    private static let calendarBundleIdentifier = "com.apple.iCal"
+
+    /// Starts Calendar.app hidden in the background when it isn't running,
+    /// so the first drop doesn't pay its multi-second cold launch inside the
+    /// automation run. A Calendar the user already has open is left alone.
+    /// Launching needs no Automation permission and sends no Apple events.
+    func warmUpCalendarApp() {
+        guard NSRunningApplication.runningApplications(withBundleIdentifier: Self.calendarBundleIdentifier).isEmpty,
+              let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.calendarBundleIdentifier) else {
+            return
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.hides = true
+        configuration.addsToRecentItems = false
+        configuration.promptsUserIfNeeded = false
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, _ in }
     }
 
     // MARK: - Subprocess plumbing
@@ -261,7 +351,9 @@ final class CalendarAutomation {
             isSeries: event.isSeries,
             requiredEmails: requiredEmails,
             reviewedMissingKeys: reviewedMissingKeys,
-            knownUID: knownUID
+            knownUID: knownUID,
+            calendarIdentifier: event.calendarIdentifier,
+            externalIdentifier: event.calendarItemExternalIdentifier
         )
     }
 
@@ -276,6 +368,13 @@ final class CalendarAutomation {
         let requiredEmails: [String]
         let reviewedMissingKeys: [String]
         let knownUID: String
+        /// EventKit calendarIdentifier; equals Calendar's scripting
+        /// calendar id, so the script can select the calendar exactly.
+        let calendarIdentifier: String
+        /// EventKit calendarItemExternalIdentifier (the iCalendar UID);
+        /// Calendar's byId accepts it, letting the script skip its scan.
+        /// Always verified by the identity check.
+        let externalIdentifier: String
     }
 
     private func execute(payload: ScriptPayload) async throws -> ScriptOutput {
@@ -287,16 +386,25 @@ final class CalendarAutomation {
         let payloadJSON = String(decoding: payloadData, as: UTF8.self)
 
         let run = try await Self.runScript(scriptURL: scriptURL, payloadJSON: payloadJSON)
-        if run.timedOut || run.exitStatus != 0 || !run.stderr.isEmpty {
-            // Nonzero exit/stderr/timeout are errors even if stdout parsed.
-            throw CalendarAutomationError.scriptFailed(
-                message: run.timedOut
-                    ? "Calendar automation timed out after 120 seconds."
-                    : (run.stderr.isEmpty ? "Calendar automation exited with status \(run.exitStatus)." : run.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
-            )
+        try Task.checkCancellation()
+        if run.timedOut {
+            throw CalendarAutomationError.calendarTimedOut
         }
-        guard let data = run.stdout.data(using: .utf8),
-              let output = try? JSONDecoder().decode(ScriptOutput.self, from: data) else {
+        // A clean exit with well-formed stdout is authoritative: osascript
+        // and JavaScriptCore sometimes print benign warnings to stderr, and
+        // treating those as failures turned successful writes into
+        // "unconfirmed" recoveries. stderr only explains real failures.
+        let decoded = run.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(ScriptOutput.self, from: $0) }
+        guard run.exitStatus == 0, let output = decoded else {
+            let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let mapped = Self.classify(errorNumber: Self.errorNumber(inStderr: stderr)) {
+                throw mapped
+            }
+            if run.exitStatus != 0 || !stderr.isEmpty {
+                throw CalendarAutomationError.scriptFailed(
+                    message: stderr.isEmpty ? "Calendar automation exited with status \(run.exitStatus)." : stderr
+                )
+            }
             throw CalendarAutomationError.invalidOutput("stdout was not the expected JSON")
         }
         guard output.status != "error" else {
@@ -306,6 +414,9 @@ final class CalendarAutomation {
     }
 
     private func error(for output: ScriptOutput, default fallback: CalendarAutomationError) -> CalendarAutomationError {
+        if let mapped = Self.classify(errorNumber: output.errorNumber) {
+            return mapped
+        }
         let message = output.message ?? ""
         if message.contains("Cannot safely match this event in Calendar") {
             return .identityMismatch
@@ -313,9 +424,36 @@ final class CalendarAutomation {
         return fallback
     }
 
+    /// Holds the running process so task cancellation can terminate it.
+    nonisolated private final class ProcessHandle: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        private var cancelled = false
+
+        /// Records a started process; false means cancellation already
+        /// happened and the caller must terminate it.
+        func attach(_ process: Process) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            guard !cancelled else { return false }
+            self.process = process
+            return true
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let process = self.process
+            lock.unlock()
+            if let process, process.isRunning { process.terminate() }
+        }
+    }
+
     /// Runs the script in a detached task (never on the main actor). stdout and
     /// stderr are drained concurrently so the pipes cannot deadlock, and the
-    /// process is terminated after the timeout.
+    /// process is terminated after the timeout or when the calling task is
+    /// cancelled — an abandoned read-only run must not keep Calendar.app
+    /// busy, because Calendar serves Apple events one at a time and every
+    /// later run would queue behind it.
     nonisolated private static func runScript(scriptURL: URL, payloadJSON: String, timeoutSeconds: Int = 120) async throws -> ScriptRunResult {
         final class Flag: @unchecked Sendable {
             private let lock = NSLock()
@@ -329,44 +467,50 @@ final class CalendarAutomation {
             }
         }
 
-        return try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-l", "JavaScript", scriptURL.path, payloadJSON]
-            let stdoutPipe = Pipe()
-            let stderrPipe = Pipe()
-            process.standardOutput = stdoutPipe
-            process.standardError = stderrPipe
-            try process.run()
+        let handle = ProcessHandle()
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                process.arguments = ["-l", "JavaScript", scriptURL.path, payloadJSON]
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+                try process.run()
+                if !handle.attach(process) { process.terminate() }
 
-            let timedOut = Flag()
-            let watchdog = Task.detached(priority: .utility) {
-                try? await Task.sleep(for: .seconds(timeoutSeconds))
-                if !Task.isCancelled {
-                    timedOut.set()
-                    if process.isRunning { process.terminate() }
-                }
-            }
-
-            @Sendable func drain(_ handle: FileHandle) async -> Data {
-                await withCheckedContinuation { continuation in
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        continuation.resume(returning: handle.readDataToEndOfFile())
+                let timedOut = Flag()
+                let watchdog = Task.detached(priority: .utility) {
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    if !Task.isCancelled {
+                        timedOut.set()
+                        if process.isRunning { process.terminate() }
                     }
                 }
-            }
-            async let stdoutData = drain(stdoutPipe.fileHandleForReading)
-            async let stderrData = drain(stderrPipe.fileHandleForReading)
-            let out = await stdoutData
-            let err = await stderrData
-            watchdog.cancel()
-            process.waitUntilExit()
-            return ScriptRunResult(
-                stdout: String(decoding: out, as: UTF8.self),
-                stderr: String(decoding: err, as: UTF8.self),
-                exitStatus: process.terminationStatus,
-                timedOut: timedOut.isSet
-            )
-        }.value
+
+                @Sendable func drain(_ handle: FileHandle) async -> Data {
+                    await withCheckedContinuation { continuation in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            continuation.resume(returning: handle.readDataToEndOfFile())
+                        }
+                    }
+                }
+                async let stdoutData = drain(stdoutPipe.fileHandleForReading)
+                async let stderrData = drain(stderrPipe.fileHandleForReading)
+                let out = await stdoutData
+                let err = await stderrData
+                watchdog.cancel()
+                process.waitUntilExit()
+                return ScriptRunResult(
+                    stdout: String(decoding: out, as: UTF8.self),
+                    stderr: String(decoding: err, as: UTF8.self),
+                    exitStatus: process.terminationStatus,
+                    timedOut: timedOut.isSet
+                )
+            }.value
+        } onCancel: {
+            handle.cancel()
+        }
     }
 }
