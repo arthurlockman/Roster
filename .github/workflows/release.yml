@@ -142,14 +142,6 @@ jobs:
           echo "value=$v" >> "$GITHUB_OUTPUT"
           echo "Minimum system version: $v"
 
-      # ── Sign with Developer ID (optional) ──────────────────────
-      - name: Code sign app
-        if: env.DEVELOPER_ID_P12_BASE64 != ''
-        run: |
-          codesign --force --deep --timestamp --options runtime \
-            --sign "Developer ID Application" \
-            --entitlements RosterApp/Roster/Roster.entitlements \
-            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app"
 
       # ── Package ────────────────────────────────────────────────
       - name: Create release zip
