@@ -181,6 +181,12 @@ function validatePayload(payload) {
     if (isNaN(new Date(payload.startDate).getTime()) || isNaN(new Date(payload.endDate).getTime())) {
         throw new Error("Invalid payload: startDate/endDate must be ISO-8601");
     }
+    if (typeof payload.occurrenceOnly !== "undefined" && typeof payload.occurrenceOnly !== "boolean") {
+        throw new Error("Invalid payload: occurrenceOnly must be a boolean");
+    }
+    if (payload.occurrenceOnly === true && payload.isSeries) {
+        throw new Error("Invalid payload: occurrenceOnly targets one event, so isSeries must be false");
+    }
     ["knownUID", "calendarIdentifier", "externalIdentifier"].forEach(function (key) {
         if (typeof payload[key] !== "undefined" && typeof payload[key] !== "string") {
             throw new Error("Invalid payload: " + key + " must be a string");
@@ -371,6 +377,22 @@ function seriesExternalIdentifier(identifier) {
     return index >= 0 ? identifier.slice(0, index) : identifier;
 }
 
+// The single changed occurrence the user chose to edit on its own. Only its
+// own "<series uid>/RID=<n>" identifier addresses it; knownUID and a scan
+// would both address the series master, so neither is used, and anything
+// short of an exact title/start/end match on that occurrence fails closed.
+function findChangedOccurrence(calendars, payload) {
+    if (!isDetachedIdentifier(payload.externalIdentifier)) throw new Error(IDENTITY_MISMATCH_MESSAGE);
+    var occurrence = null;
+    try { occurrence = calendars[0].events.byId(payload.externalIdentifier); } catch (e) { occurrence = null; }
+    var meta = null;
+    if (occurrence) {
+        try { meta = candidateMeta(occurrence); } catch (e2) { meta = null; }
+    }
+    if (meta === null || matchCandidates([meta], payload).length !== 1) throw new Error(IDENTITY_MISMATCH_MESSAGE);
+    return occurrence;
+}
+
 // Exactly one event across the candidate calendars matching the payload
 // identity.
 //
@@ -385,6 +407,7 @@ function seriesExternalIdentifier(identifier) {
 // identity check still runs on the resolved event, so a stale or wrong uid
 // can only cost the fallback scan — never a wrong write.
 function findEvent(calendars, payload) {
+    if (payload.occurrenceOnly === true) return findChangedOccurrence(calendars, payload);
     // knownUID (from a locate run) first, then EventKit's external
     // identifier (the iCalendar UID), which Calendar's byId also accepts.
     var tried = {};
@@ -480,7 +503,9 @@ function run(argv) {
 
         var event = findEvent(findCalendars(Calendar, payload), payload);
 
-        var isSeries = seriesFlag(event);
+        // A changed occurrence edited on its own is one event, not a series,
+        // even though Calendar reports its series' recurrence on it.
+        var isSeries = payload.occurrenceOnly === true ? false : seriesFlag(event);
 
         // Locate is a read-only identity resolution for the app's fast apply:
         // the matched event's scripting uid, so a later apply can resolve it
@@ -538,21 +563,30 @@ function run(argv) {
         // the same result and invite delivery without it, and it refreshed
         // every account in Calendar.
 
+        // Calendar can take a moment to finish saving, especially for an
+        // occurrence edited on its own: reading back right away has failed or
+        // returned the old list even though the write landed. Re-read a few
+        // times before deciding the write is unconfirmed (~1 s at most).
         var afterEmails = null;
-        try {
-            afterEmails = readAttendeeEmails(event);
-        } catch (e) {
-            afterEmails = null;
+        var verifyError = null;
+        for (var attempt = 0; attempt < 4; attempt++) {
+            if (attempt > 0) delay(0.25);
+            try {
+                afterEmails = readAttendeeEmails(event);
+                verifyError = null;
+            } catch (e) {
+                afterEmails = null;
+                verifyError = String(e.message || e);
+            }
+            if (afterEmails !== null && missingEmailKeys(payload.reviewedMissingKeys, afterEmails).length === 0) break;
+            if (appendError !== null) break; // Nothing more is coming; report now.
         }
 
         if (afterEmails === null) {
-            if (appendError !== null) {
-                return output("error", {
-                    message: UNCONFIRMED_MESSAGE,
-                    warning: appendError
-                });
-            }
-            return output("error", { message: UNCONFIRMED_MESSAGE });
+            return output("error", {
+                message: UNCONFIRMED_MESSAGE,
+                warning: appendError !== null ? appendError : "Reading invitees back failed: " + verifyError
+            });
         }
 
         var added = [];

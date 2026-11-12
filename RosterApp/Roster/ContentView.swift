@@ -48,6 +48,8 @@ struct ContentView: View {
             // instance saved while we were inactive.
             if phase == .active {
                 model.rosterStore.reload()
+                // The user may have just changed it in System Settings.
+                Task { await model.refreshAutomationPermission() }
             }
         }
         .sheet(isPresented: $showingOnboarding) {
@@ -62,6 +64,8 @@ struct ContentView: View {
         }
         .sheet(isPresented: BindableSheet(model, keyPath: \.showsFlowSheet)) {
             switch model.flow {
+            case .choosingScope(let event, _):
+                ScopeSheet(model: model, event: event)
             case .previewing(let event, _):
                 PreviewSheet(event: event)
             case .reviewing(let review):
@@ -170,6 +174,10 @@ struct ContentView: View {
             }
             .padding(.horizontal)
 
+            if model.calendarService.accessState == .authorized {
+                automationNotice
+            }
+
             if model.calendarService.accessState == .denied {
                 deniedCalendarNotice
             } else if let fetchError = model.calendarService.fetchError {
@@ -204,6 +212,42 @@ struct ContentView: View {
             Button("Open System Settings") { Self.openPrivacySettings() }
         }
         .padding()
+    }
+
+    /// Shown above the day list when Roster can read events but can't add
+    /// invitees, so a missing Automation grant shows up before a drop fails.
+    @ViewBuilder
+    private var automationNotice: some View {
+        switch model.automationPermission {
+        case .denied:
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Roster can't add invitees yet.").font(.headline)
+                Text("Turn on Calendar under Roster in System Settings → Privacy & Security → Automation. You can still browse events and edit rosters.")
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open Automation Settings") { Self.openAutomationSettings() }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal)
+        case .needsConsent:
+            HStack {
+                Text("Roster needs permission to add invitees through Calendar.")
+                Spacer()
+                Button("Allow…") { Task { await model.requestAutomationPermission() } }
+            }
+            .padding(10)
+            .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal)
+        case .granted, .unknown:
+            EmptyView()
+        }
+    }
+
+    static func openAutomationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     static func openPrivacySettings() {
@@ -759,7 +803,10 @@ private struct ReviewSheet: View {
             Text(review.event.startDate, format: .dateTime.weekday().day().month().year().hour().minute())
                 .foregroundStyle(.secondary)
 
-            if review.isSeries {
+            if review.onlyThisOccurrence {
+                Label("Add to this event only (the rest of the series is unchanged)", systemImage: "calendar")
+                    .foregroundStyle(.orange)
+            } else if review.isSeries {
                 Label("Add to recurring series (edited occurrences may differ)", systemImage: "repeat")
                     .foregroundStyle(.orange)
             }
@@ -787,6 +834,41 @@ private struct ReviewSheet: View {
         }
         .padding(20)
         .frame(width: 420)
+    }
+}
+
+// MARK: - Scope sheet
+
+/// Asked when a roster is dropped on an occurrence that was edited
+/// separately from its series. Nothing is read or written until a choice.
+private struct ScopeSheet: View {
+    let model: AppModel
+    let event: EventSnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Edit just this event?").font(.title2.bold())
+            Text(event.title.isEmpty ? "(untitled)" : event.title)
+                .font(.headline)
+            Text(event.startDate, format: .dateTime.weekday().day().month().year().hour().minute())
+                .foregroundStyle(.secondary)
+            Text("This event was changed separately from its recurring series. Choose where to add the missing invitees.")
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Adding to the series usually doesn't change this event, because it keeps its own invitee list.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Cancel", role: .cancel) { model.cancelReview() }
+                    .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("All Events in Series") { model.chooseScope(onlyThisOccurrence: false) }
+                Button("This Event Only") { model.chooseScope(onlyThisOccurrence: true) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
     }
 }
 

@@ -880,6 +880,65 @@ struct FindEventTests {
         #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
         #expect(eval(context, "stats.searches").toInt32() == 0)
     }
+
+    // MARK: Single changed occurrence
+
+    private let changedOccurrenceSetup = """
+    var master = { uid: "m", summary: "Standup", start: "2026-11-02T18:00:00Z", end: "2026-11-02T18:30:00Z", recurrence: "FREQ=WEEKLY;INTERVAL=1" };
+    var changed = { uid: "m/RID=1", summary: "Standup", start: "2026-11-12T18:00:00Z", end: "2026-11-12T18:30:00Z", recurrence: "FREQ=WEEKLY;INTERVAL=1" };
+    var p = JSON.parse(JSON.stringify(payload));
+    p.occurrenceOnly = true; p.isSeries = false; p.externalIdentifier = "m/RID=1"; p.knownUID = "m";
+    stats.searches = 0;
+    """
+
+    @Test func occurrenceOnlyResolvesTheChangedOccurrence() throws {
+        let context = try makeContext()
+        let uid = eval(context, changedOccurrenceSetup + """
+        lookup(mockApp([mockCalendar("Calendar", true, [master, changed])]), p)
+        """).toString()
+        #expect(uid == "m/RID=1", "must not fall back to the series master, even with a series knownUID")
+        #expect(eval(context, "stats.searches").toInt32() == 0)
+    }
+
+    @Test func occurrenceOnlyNeverFallsBackToTheSeries() throws {
+        let context = try makeContext()
+        // The occurrence can't be resolved; the series master is right there
+        // with a matching knownUID, but writing to it would be the wrong scope.
+        let result = eval(context, changedOccurrenceSetup + """
+        lookup(mockApp([mockCalendar("Calendar", true, [master])]), p)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+        #expect(eval(context, "stats.searches").toInt32() == 0)
+    }
+
+    @Test func occurrenceOnlyRequiresAnOccurrenceIdentifier() throws {
+        let context = try makeContext()
+        let result = eval(context, changedOccurrenceSetup + """
+        p.externalIdentifier = "m";
+        lookup(mockApp([mockCalendar("Calendar", true, [master, changed])]), p)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+    }
+
+    @Test func occurrenceOnlyChecksTheOccurrenceTime() throws {
+        let context = try makeContext()
+        let result = eval(context, changedOccurrenceSetup + """
+        p.startDate = "2026-11-12T19:00:00Z"; p.endDate = "2026-11-12T19:30:00Z";
+        lookup(mockApp([mockCalendar("Calendar", true, [master, changed])]), p)
+        """).toString()
+        #expect(result?.hasPrefix("ERROR: Cannot safely match") == true)
+    }
+
+    @Test func occurrenceOnlyWithSeriesScopeIsRejected() throws {
+        let context = try makeContext()
+        let result = eval(context, """
+        var bad = JSON.parse(JSON.stringify(payload));
+        bad.mode = "preview"; bad.requiredEmails = []; bad.reviewedMissingKeys = [];
+        bad.occurrenceOnly = true; bad.isSeries = true;
+        try { validatePayload(bad); "accepted"; } catch (e) { e.message; }
+        """).toString()
+        #expect(result?.contains("isSeries must be false") == true)
+    }
 }
 
 /// Apple event errors surface as actionable messages instead of raw text.

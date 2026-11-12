@@ -241,21 +241,50 @@ final class CalendarService {
         )
     }
 
-    /// Attendee email addresses for one event, read in-process via
-    /// EventKit. Returns nil when the event is gone or its attendee list
-    /// is unknown — an unknown list must never look like an empty one, so
-    /// callers fail closed to the osascript preview instead. EventKit reports
-    /// "no invitees" as `attendees == nil`; with `hasAttendees == false` that
-    /// is a known empty list, not an unknown one. Treating it as empty is safe
-    /// because apply re-reads attendees inside Calendar before writing.
+    /// Attendee email addresses of the invitee list Roster would write to,
+    /// read in-process via EventKit: the event itself, or for a recurring
+    /// event the series. Returns nil when that list is unknown or isn't the
+    /// one in hand — an unknown list must never look like an empty one, so
+    /// callers fail closed to the osascript preview, which reads exactly
+    /// what apply writes to.
+    ///
+    /// - A detached (individually edited) occurrence can carry its own
+    ///   invitees, but Roster writes to the series, so this returns nil and
+    ///   the script reads the series.
+    /// - For other occurrences the dropped occurrence is re-fetched; its
+    ///   invitees are the series'. `event(withIdentifier:)` would return the
+    ///   series' first occurrence, which may itself be detached.
+    /// - EventKit reports "no invitees" as `attendees == nil`; with
+    ///   `hasAttendees == false` that is a known empty list. Treating it as
+    ///   empty is safe because apply re-reads attendees in Calendar first.
+    ///
     /// EKParticipant exposes its address only as a mailto: URL; keys are
     /// normalized exactly like the script normalizes emails.
-    func attendeeEmails(forEventIdentifier identifier: String) -> [String]? {
-        guard accessState == .authorized, !identifier.isEmpty else { return nil }
-        guard let event = activeStore.event(withIdentifier: identifier) else { return nil }
+    ///
+    /// With `onlyThisOccurrence` the target is the changed occurrence itself,
+    /// so its own invitee list is the right one to read.
+    func attendeeEmails(for snapshot: EventSnapshot, onlyThisOccurrence: Bool = false) -> [String]? {
+        guard accessState == .authorized, !snapshot.eventIdentifier.isEmpty else { return nil }
+        guard snapshot.isDetached == onlyThisOccurrence else { return nil }
+        guard let event = currentEvent(for: snapshot), event.isDetached == onlyThisOccurrence else { return nil }
         guard let attendees = event.attendees else {
             return event.hasAttendees ? nil : []
         }
         return attendees.compactMap { normalizedEmailKey($0.url.absoluteString) }
+    }
+
+    /// The live EKEvent for a snapshot: by identifier for a one-off event,
+    /// or the exact occurrence (same identifier and start) for a series.
+    private func currentEvent(for snapshot: EventSnapshot) -> EKEvent? {
+        guard snapshot.isSeries else {
+            return activeStore.event(withIdentifier: snapshot.eventIdentifier)
+        }
+        guard let calendar = activeStore.calendar(withIdentifier: snapshot.calendarIdentifier) else { return nil }
+        let end = max(snapshot.endDate, snapshot.startDate.addingTimeInterval(1))
+        let predicate = activeStore.predicateForEvents(withStart: snapshot.startDate, end: end, calendars: [calendar])
+        let matches = activeStore.events(matching: predicate).filter {
+            $0.eventIdentifier == snapshot.eventIdentifier && $0.startDate == snapshot.startDate
+        }
+        return matches.count == 1 ? matches[0] : nil
     }
 }

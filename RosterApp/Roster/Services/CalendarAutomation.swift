@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import os
 
 /// The only attendee-mutation path: a background `osascript` process talking
 /// to Calendar.app. EventKit is never used for writes.
@@ -56,6 +57,9 @@ nonisolated struct Review: Sendable {
     let missingKeys: [String]
     let isSeries: Bool
     let locatedUID: String?
+    /// The user chose to edit only this changed (detached) occurrence rather
+    /// than its series; `isSeries` is then false.
+    var onlyThisOccurrence: Bool = false
 
     /// Human-readable rows for the dialog: names/emails of missing invitees.
     var missingInvitees: [Invitee] {
@@ -71,7 +75,8 @@ nonisolated struct Review: Sendable {
             required: required,
             missingKeys: missingKeys,
             isSeries: isSeries,
-            locatedUID: uid
+            locatedUID: uid,
+            onlyThisOccurrence: onlyThisOccurrence
         )
     }
 }
@@ -128,13 +133,14 @@ final class CalendarAutomation {
     /// True while a mutation subprocess runs; the UI disables repeated Confirm.
     private(set) var busy = false
 
-    func preview(event: EventSnapshot, roster: Roster) async throws -> Review {
+    func preview(event: EventSnapshot, roster: Roster, onlyThisOccurrence: Bool = false) async throws -> Review {
         let payload = try makePayload(
             mode: "preview",
             event: event,
             requiredEmails: roster.members.map(\.email),
             reviewedMissingKeys: [],
-            knownUID: ""
+            knownUID: "",
+            onlyThisOccurrence: onlyThisOccurrence
         )
         let output = try await execute(payload: payload)
         guard output.status == "preview" else {
@@ -145,8 +151,9 @@ final class CalendarAutomation {
             rosterID: roster.id,
             required: roster.members,
             missingKeys: output.missingKeys ?? [],
-            isSeries: output.isSeries ?? event.isSeries,
-            locatedUID: nil
+            isSeries: output.isSeries ?? (onlyThisOccurrence ? false : event.isSeries),
+            locatedUID: nil,
+            onlyThisOccurrence: onlyThisOccurrence
         )
     }
 
@@ -183,7 +190,8 @@ final class CalendarAutomation {
             event: review.event,
             requiredEmails: review.required.map(\.email),
             reviewedMissingKeys: review.missingKeys,
-            knownUID: review.locatedUID ?? ""
+            knownUID: review.locatedUID ?? "",
+            onlyThisOccurrence: review.onlyThisOccurrence
         )
         do {
             let output = try await execute(payload: payload)
@@ -195,7 +203,8 @@ final class CalendarAutomation {
                     required: review.required,
                     missingKeys: output.missingKeys ?? [],
                     isSeries: output.isSeries ?? review.isSeries,
-                    locatedUID: review.locatedUID
+                    locatedUID: review.locatedUID,
+                    onlyThisOccurrence: review.onlyThisOccurrence
                 ))
             case "finished":
                 return .finished(
@@ -242,7 +251,13 @@ final class CalendarAutomation {
             return (added, remaining)
         }
 
-        let eventKitEmails = currentAttendees()
+        // EventKit can lag a write Calendar just made by a moment; give it
+        // one more look before asking Calendar again.
+        var eventKitEmails = currentAttendees()
+        if eventKitEmails.map({ split($0).remaining.isEmpty }) != true {
+            try? await Task.sleep(for: .seconds(1))
+            eventKitEmails = currentAttendees() ?? eventKitEmails
+        }
         if let eventKitEmails {
             let result = split(eventKitEmails)
             if result.remaining.isEmpty {
@@ -259,7 +274,8 @@ final class CalendarAutomation {
             event: review.event,
             requiredEmails: review.required.map(\.email),
             reviewedMissingKeys: [],
-            knownUID: review.locatedUID ?? ""
+            knownUID: review.locatedUID ?? "",
+            onlyThisOccurrence: review.onlyThisOccurrence
         )
         if let output = try? await execute(payload: previewPayload), output.status == "preview" {
             let result = split(output.attendeeEmails ?? [])
@@ -300,14 +316,16 @@ final class CalendarAutomation {
 
     // MARK: - Calendar warm-up
 
-    private static let calendarBundleIdentifier = "com.apple.iCal"
+    nonisolated private static let calendarBundleIdentifier = "com.apple.iCal"
 
     /// Starts Calendar.app hidden in the background when it isn't running,
     /// so the first drop doesn't pay its multi-second cold launch inside the
-    /// automation run. A Calendar the user already has open is left alone.
-    /// Launching needs no Automation permission and sends no Apple events.
-    func warmUpCalendarApp() {
-        guard NSRunningApplication.runningApplications(withBundleIdentifier: Self.calendarBundleIdentifier).isEmpty,
+    /// automation run, and so the Automation permission can be checked
+    /// (that check needs a running target). A Calendar the user already has
+    /// open is left alone. Launching needs no Automation permission and
+    /// sends no Apple events. Returns once Calendar is running, or on failure.
+    func launchCalendarIfNeeded() async {
+        guard !Self.isCalendarRunning,
               let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: Self.calendarBundleIdentifier) else {
             return
         }
@@ -316,7 +334,49 @@ final class CalendarAutomation {
         configuration.hides = true
         configuration.addsToRecentItems = false
         configuration.promptsUserIfNeeded = false
-        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, _ in }
+        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+    }
+
+    static var isCalendarRunning: Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: calendarBundleIdentifier).isEmpty
+    }
+
+    // MARK: - Automation permission
+
+    enum AutomationPermission: Equatable, Sendable {
+        /// Not checked yet, or Calendar wasn't running to check against.
+        case unknown
+        case granted
+        /// The user turned it off (or declined the prompt).
+        case denied
+        /// Never asked; the next Apple event will prompt.
+        case needsConsent
+    }
+
+    /// Roster's Automation → Calendar permission, via
+    /// AEDeterminePermissionToAutomateTarget. With `ask` it shows the system
+    /// consent prompt when the user hasn't decided yet. The osascript
+    /// subprocess runs under Roster's permission (Roster is its responsible
+    /// process), so this is the same grant the automation uses. The call
+    /// blocks until answered, so it runs off the main actor. Calendar must
+    /// be running; otherwise the answer is `.unknown`.
+    nonisolated static func automationPermission(ask: Bool) async -> AutomationPermission {
+        await Task.detached(priority: .userInitiated) {
+            var target = AEAddressDesc()
+            let created = calendarBundleIdentifier.withCString { pointer in
+                AECreateDesc(DescType(typeApplicationBundleID), pointer, strlen(pointer), &target)
+            }
+            guard created == noErr else { return .unknown }
+            defer { AEDisposeDesc(&target) }
+            let status = AEDeterminePermissionToAutomateTarget(
+                &target, AEEventClass(typeWildCard), AEEventID(typeWildCard), ask)
+            switch Int(status) {
+            case Int(noErr): return .granted
+            case -1743: return .denied        // errAEEventNotPermitted
+            case -1744: return .needsConsent  // errAEEventWouldRequireUserConsent
+            default: return .unknown          // e.g. procNotFound: Calendar not running
+            }
+        }.value
     }
 
     // MARK: - Subprocess plumbing
@@ -335,7 +395,7 @@ final class CalendarAutomation {
         let timedOut: Bool
     }
 
-    private func makePayload(mode: String, event: EventSnapshot, requiredEmails: [String], reviewedMissingKeys: [String], knownUID: String) throws -> ScriptPayload {
+    private func makePayload(mode: String, event: EventSnapshot, requiredEmails: [String], reviewedMissingKeys: [String], knownUID: String, onlyThisOccurrence: Bool = false) throws -> ScriptPayload {
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(identifier: "UTC")
         guard !event.eventIdentifier.isEmpty, !event.calendarTitle.isEmpty else {
@@ -348,7 +408,8 @@ final class CalendarAutomation {
             startDate: formatter.string(from: event.startDate),
             endDate: formatter.string(from: event.endDate),
             isAllDay: event.isAllDay,
-            isSeries: event.isSeries,
+            isSeries: onlyThisOccurrence ? false : event.isSeries,
+            occurrenceOnly: onlyThisOccurrence,
             requiredEmails: requiredEmails,
             reviewedMissingKeys: reviewedMissingKeys,
             knownUID: knownUID,
@@ -365,6 +426,8 @@ final class CalendarAutomation {
         let endDate: String
         let isAllDay: Bool
         let isSeries: Bool
+        /// Edit only this changed occurrence, addressed by its "/RID=" id.
+        let occurrenceOnly: Bool
         let requiredEmails: [String]
         let reviewedMissingKeys: [String]
         let knownUID: String
@@ -377,6 +440,23 @@ final class CalendarAutomation {
         let externalIdentifier: String
     }
 
+    nonisolated private static let log = Logger(subsystem: "dev.arosa.roster", category: "automation")
+
+    /// Every failed or unexpected script run goes to the unified log, so a
+    /// report like "it said unconfirmed" can be traced afterwards:
+    /// `log show --last 1h --predicate 'subsystem == "dev.arosa.roster"'`.
+    /// Status and error numbers are public; messages can contain email
+    /// addresses, so they stay private.
+    nonisolated private static func logFailure(mode: String, run: ScriptRunResult, output: ScriptOutput?) {
+        log.error("""
+            \(mode, privacy: .public) failed: status=\(output?.status ?? "no-output", privacy: .public) \
+            exit=\(run.exitStatus, privacy: .public) timedOut=\(run.timedOut, privacy: .public) \
+            errorNumber=\(output?.errorNumber.map(String.init) ?? "none", privacy: .public) \
+            message=\(output?.message ?? "", privacy: .private) warning=\(output?.warning ?? "", privacy: .private) \
+            stderr=\(run.stderr, privacy: .private)
+            """)
+    }
+
     private func execute(payload: ScriptPayload) async throws -> ScriptOutput {
         guard let scriptURL = Self.scriptURL() else { throw CalendarAutomationError.scriptUnavailable }
         let encoder = JSONEncoder()
@@ -387,6 +467,10 @@ final class CalendarAutomation {
 
         let run = try await Self.runScript(scriptURL: scriptURL, payloadJSON: payloadJSON)
         try Task.checkCancellation()
+        let decoded = run.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(ScriptOutput.self, from: $0) }
+        if run.timedOut || run.exitStatus != 0 || decoded == nil || decoded?.status == "error" || decoded?.warning != nil {
+            Self.logFailure(mode: payload.mode, run: run, output: decoded)
+        }
         if run.timedOut {
             throw CalendarAutomationError.calendarTimedOut
         }
@@ -394,7 +478,6 @@ final class CalendarAutomation {
         // and JavaScriptCore sometimes print benign warnings to stderr, and
         // treating those as failures turned successful writes into
         // "unconfirmed" recoveries. stderr only explains real failures.
-        let decoded = run.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(ScriptOutput.self, from: $0) }
         guard run.exitStatus == 0, let output = decoded else {
             let stderr = run.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             if let mapped = Self.classify(errorNumber: Self.errorNumber(inStderr: stderr)) {

@@ -9,7 +9,7 @@ Roster is a macOS app for managing invitee sets and filling out event invitation
 - **Calendar day view** — pick which calendars to read, navigate previous/today/next, and see events sorted all-day-first with their current invitee counts.
 - **Drag-to-event preview** — dragging a roster onto an event shows exactly which roster members are *not* yet invited before anything is written. If everyone is already there, it says so.
 - **Add-only invitee addition** — confirming adds only the missing addresses. Existing invitees (accepted, declined, tentative, or pending) are never touched, removed, or re-RSVP'd.
-- **Recurring-event safety** — recurring events are labeled "Add to recurring series (edited occurrences may differ)" and operate on the whole series, never a single silently-edited instance.
+- **Recurring-event safety** — dropping on a recurring event adds to the whole series, labeled "Add to recurring series (edited occurrences may differ)". If the occurrence you drop on was changed separately from its series, Roster asks whether to add to **this event only** or **all events in the series** — never silently picking one.
 - **Contacts integration** — search your saved and synced contacts across all accounts. For corporate directory (GAL/LDAP) results, which Contacts.framework can't query directly, Roster shows how to save the result into Contacts.app first and then find it here.
 
 ## How attendee additions work

@@ -16,6 +16,9 @@ final class AppModel {
 
     enum Flow {
         case idle
+        /// Dropped on a changed occurrence: asking whether to edit just that
+        /// occurrence or the whole series. Nothing has been read or written.
+        case choosingScope(event: EventSnapshot, rosterID: UUID)
         case previewing(event: EventSnapshot, rosterID: UUID)
         case reviewing(Review)
         case applying(Review)
@@ -36,6 +39,8 @@ final class AppModel {
     private(set) var resultMessage: String?
     /// One-shot error outside the review flow (permissions, mismatch, crash).
     var alertMessage: String?
+    /// Roster's Automation → Calendar permission, as last checked.
+    private(set) var automationPermission: CalendarAutomation.AutomationPermission = .unknown
 
     var isBusy: Bool {
         // Preview blocks drops too: a second drop would overwrite the flow
@@ -116,12 +121,45 @@ final class AppModel {
         }
     }
 
+    /// Calendar first, then Automation (prompting now, during setup, rather
+    /// than on the first drop), then Contacts. Automation needs Calendar
+    /// running to be checked, so Calendar is launched hidden first; that also
+    /// takes its cold start off the first drop.
     func requestPermissions() async {
         await calendarService.requestAccess()
         if calendarService.accessState == .authorized {
-            automation.warmUpCalendarApp()
+            await automation.launchCalendarIfNeeded()
+            await updateAutomationPermission(ask: true)
         }
         await contactsService.requestAccess()
+    }
+
+    /// Re-checks without prompting, e.g. after returning from System
+    /// Settings. An inconclusive answer (Calendar not running) keeps the
+    /// last known state.
+    func refreshAutomationPermission() async {
+        guard calendarService.accessState == .authorized, CalendarAutomation.isCalendarRunning else { return }
+        await updateAutomationPermission(ask: false)
+    }
+
+    /// Asks again from the in-app notice when the user never answered.
+    func requestAutomationPermission() async {
+        await automation.launchCalendarIfNeeded()
+        await updateAutomationPermission(ask: true)
+    }
+
+    private func updateAutomationPermission(ask: Bool) async {
+        let permission = await CalendarAutomation.automationPermission(ask: ask)
+        if permission != .unknown {
+            automationPermission = permission
+        }
+    }
+
+    /// Records a denial seen by an automation run, so the notice appears.
+    private func noteAutomationError(_ error: any Error) {
+        if let error = error as? CalendarAutomationError, error == .notAuthorized {
+            automationPermission = .denied
+        }
     }
     /// Entry point for a drop of `rosterID` onto `event`. Drops on targets we
     /// cannot safely automate are ignored.
@@ -131,14 +169,29 @@ final class AppModel {
             alertMessage = "This event cannot accept invitees: it is canceled, read-only, or missing identifiers Calendar can match."
             return
         }
+        guard automationPermission != .denied else {
+            alertMessage = CalendarAutomationError.notAuthorized.errorDescription
+            return
+        }
         guard rosterStore.persistentError == nil else { return }
         guard let roster = rosterStore.rosters.first(where: { $0.id == rosterID }), !roster.members.isEmpty else {
+            return
+        }
+        if event.isDetached {
+            // Changed occurrence: the user picks the scope before any read.
+            flow = .choosingScope(event: event, rosterID: rosterID)
             return
         }
         startPreview(event: event, rosterID: rosterID)
     }
 
-    private func startPreview(event: EventSnapshot, rosterID: UUID) {
+    /// Continues a drop on a changed occurrence with the chosen scope.
+    func chooseScope(onlyThisOccurrence: Bool) {
+        guard case .choosingScope(let event, let rosterID) = flow else { return }
+        startPreview(event: event, rosterID: rosterID, onlyThisOccurrence: onlyThisOccurrence)
+    }
+
+    private func startPreview(event: EventSnapshot, rosterID: UUID, onlyThisOccurrence: Bool = false) {
         guard let roster = rosterStore.rosters.first(where: { $0.id == rosterID }) else {
             alertMessage = "That roster no longer exists."
             flow = .idle
@@ -154,7 +207,7 @@ final class AppModel {
                 // state (event gone, or no attendee list) — fail closed to
                 // the osascript preview.
                 let review: Review
-                if let emails = calendarService.attendeeEmails(forEventIdentifier: event.eventIdentifier) {
+                if let emails = calendarService.attendeeEmails(for: event, onlyThisOccurrence: onlyThisOccurrence) {
                     review = Review(
                         event: event,
                         rosterID: rosterID,
@@ -163,11 +216,12 @@ final class AppModel {
                             required: roster.members.map(\.email),
                             attendeeEmails: emails
                         ),
-                        isSeries: event.isSeries,
-                        locatedUID: nil
+                        isSeries: onlyThisOccurrence ? false : event.isSeries,
+                        locatedUID: nil,
+                        onlyThisOccurrence: onlyThisOccurrence
                     )
                 } else {
-                    review = try await automation.preview(event: event, roster: roster)
+                    review = try await automation.preview(event: event, roster: roster, onlyThisOccurrence: onlyThisOccurrence)
                 }
                 if review.missingKeys.isEmpty {
                     allPresentEvent = event
@@ -180,12 +234,18 @@ final class AppModel {
                     // lets confirm write through byId in seconds. A stale or
                     // failed locate is harmless: apply verifies the uid and
                     // falls back to its own scan.
-                    let automation = automation
-                    locateTask = Task {
-                        (try? await automation.locate(event: event)) ?? nil
+                    // Not for a single changed occurrence: locate resolves the
+                    // series, and that apply addresses the occurrence by its
+                    // own id (already instant) and must never use a series uid.
+                    if !onlyThisOccurrence {
+                        let automation = automation
+                        locateTask = Task {
+                            (try? await automation.locate(event: event)) ?? nil
+                        }
                     }
                 }
             } catch {
+                noteAutomationError(error)
                 flow = .idle
                 alertMessage = error.localizedDescription
             }
@@ -239,7 +299,7 @@ final class AppModel {
         }
         if roster.members != review.required {
             // Edited since preview: close the stale review and preview again.
-            startPreview(event: review.event, rosterID: roster.id)
+            startPreview(event: review.event, rosterID: roster.id, onlyThisOccurrence: review.onlyThisOccurrence)
             return
         }
         flow = .applying(review)
@@ -250,9 +310,10 @@ final class AppModel {
                     review = review.withLocatedUID(uid)
                 }
                 let event = review.event
+                let onlyThisOccurrence = review.onlyThisOccurrence
                 let calendarService = calendarService
                 let result = try await automation.apply(review: review) {
-                    calendarService.attendeeEmails(forEventIdentifier: event.eventIdentifier)
+                    calendarService.attendeeEmails(for: event, onlyThisOccurrence: onlyThisOccurrence)
                 }
                 switch result {
                 case .changed(let fresh):
@@ -265,6 +326,7 @@ final class AppModel {
                     await calendarService.refresh()
                 }
             } catch {
+                noteAutomationError(error)
                 cancelLocate()
                 flow = .idle
                 alertMessage = error.localizedDescription
