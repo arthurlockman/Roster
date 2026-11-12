@@ -14,7 +14,7 @@ Roster is a macOS app for managing invitee sets and filling out event invitation
 
 ## How attendee additions work
 
-EventKit can read events and attendees but [cannot add attendees](https://developer.apple.com/documentation/eventkit/ekcalendaritem/attendees). Roster therefore reads everything through EventKit, and performs the one write it needs — appending a missing invitee — through Calendar.app automation (a bundled JavaScript-for-Automation script run out-of-process). Before any write, Roster re-resolves the target event inside Calendar and verifies the event identity, attendee list, and recurrence scope still match what you reviewed. If it can't match the event safely, it refuses and tells you — it never guesses by title or date.
+EventKit can read events and attendees but [cannot add attendees](https://developer.apple.com/documentation/eventkit/ekcalendaritem/attendees). Roster therefore reads everything through EventKit, and performs the one write it needs — appending a missing invitee — through Calendar.app automation (a bundled JavaScript-for-Automation script run out-of-process). The drag preview is answered entirely in-process from EventKit, so it appears instantly; while you review, a read-only locate pass resolves the event once inside Calendar, letting the write itself resolve the same event by id in well under a second. Before any write, Roster re-resolves the target event inside Calendar and verifies the event identity, attendee list, and recurrence scope still match what you reviewed. If it can't match the event safely, it refuses and tells you — it never guesses by title or date.
 
 ## Permissions
 

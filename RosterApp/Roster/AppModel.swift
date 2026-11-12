@@ -21,6 +21,9 @@ final class AppModel {
         case applying(Review)
     }
     private(set) var flow: Flow = .idle
+    /// Background read-only locate run feeding the fast apply; the result is
+    /// dropped unless the same review is still on screen.
+    private var locateTask: Task<Void, Never>?
     /// Set when a drop found nothing to add.
     private(set) var allPresentEvent: EventSnapshot?
     /// One-shot summary of an apply attempt (success, partial, or error).
@@ -135,12 +138,45 @@ final class AppModel {
         flow = .previewing(event: event, rosterID: rosterID)
         Task {
             do {
-                let review = try await automation.preview(event: event, roster: roster)
+                // Fast path: read attendees in-process via EventKit. The drop
+                // already carries the exact event, so nothing needs to be
+                // re-matched inside Calendar.app. nil means unknown attendee
+                // state (event gone, or no attendee list) — fail closed to
+                // the osascript preview.
+                let review: Review
+                if let emails = calendarService.attendeeEmails(forEventIdentifier: event.eventIdentifier) {
+                    review = Review(
+                        event: event,
+                        rosterID: rosterID,
+                        required: roster.members,
+                        missingKeys: missingKeys(
+                            required: roster.members.map(\.email),
+                            attendeeEmails: emails
+                        ),
+                        isSeries: event.isSeries,
+                        locatedUID: nil
+                    )
+                } else {
+                    review = try await automation.preview(event: event, roster: roster)
+                }
                 if review.missingKeys.isEmpty {
                     allPresentEvent = event
                     flow = .idle
                 } else {
                     flow = .reviewing(review)
+                    // While the user reviews, resolve the event's
+                    // Calendar-scripting uid once (read-only). That scan is
+                    // the slow part of apply; overlapping it with the review
+                    // lets confirm write through byId in seconds. A stale or
+                    // failed locate is harmless: apply verifies the uid and
+                    // falls back to its own scan.
+                    locateTask = Task {
+                        guard let uid = try? await automation.locate(event: event) else { return }
+                        if case .reviewing(let current) = flow,
+                           current.rosterID == rosterID, current.event == event, current.locatedUID == nil {
+                            flow = .reviewing(current.withLocatedUID(uid))
+                        }
+                    }
                 }
             } catch {
                 flow = .idle

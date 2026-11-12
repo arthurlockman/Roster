@@ -33,19 +33,33 @@ nonisolated enum CalendarAutomationError: LocalizedError, Equatable {
 
 /// A review produced by a preview and confirmed by the user. `required` is the
 /// roster snapshot at preview time; `missingKeys` are normalized email keys in
-/// required-member order.
+/// required-member order. `locatedUID` is the Calendar-scripting uid captured
+/// by the concurrent read-only locate run (nil until it finishes); it lets
+/// apply resolve the event by id instead of rescanning the calendar.
 nonisolated struct Review: Sendable {
     let event: EventSnapshot
     let rosterID: UUID
     let required: [Invitee]
     let missingKeys: [String]
     let isSeries: Bool
+    let locatedUID: String?
 
     /// Human-readable rows for the dialog: names/emails of missing invitees.
     var missingInvitees: [Invitee] {
         missingKeys.compactMap { key in
             required.first { normalizedEmailKey($0.email) == key }
         }
+    }
+
+    func withLocatedUID(_ uid: String) -> Review {
+        Review(
+            event: event,
+            rosterID: rosterID,
+            required: required,
+            missingKeys: missingKeys,
+            isSeries: isSeries,
+            locatedUID: uid
+        )
     }
 }
 
@@ -64,12 +78,33 @@ nonisolated struct ScriptOutput: Decodable, Equatable {
     let remainingEmails: [String]?
     let warning: String?
     let message: String?
+    /// Calendar-scripting uid, returned by the locate mode.
+    let uid: String?
 }
 
 nonisolated func normalizedEmailKey(_ raw: String) -> String? {
     var value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     if value.hasPrefix("mailto:") { value.removeFirst("mailto:".count) }
     return value.isEmpty ? nil : value
+}
+
+/// Swift twin of the script's `missingEmailKeys`: required emails minus
+/// already-present attendee emails. Comparison is trimmed/lowercased with any
+/// "mailto:" prefix stripped; output keeps the required order and
+/// deduplicates by normalized key.
+nonisolated func missingKeys(required: [String], attendeeEmails: [String]) -> [String] {
+    var attendeeKeys = Set<String>()
+    for email in attendeeEmails {
+        if let key = normalizedEmailKey(email) { attendeeKeys.insert(key) }
+    }
+    var seen = Set<String>()
+    var missing: [String] = []
+    for email in required {
+        guard let key = normalizedEmailKey(email), !seen.contains(key) else { continue }
+        seen.insert(key)
+        if !attendeeKeys.contains(key) { missing.append(key) }
+    }
+    return missing
 }
 
 @MainActor
@@ -83,7 +118,8 @@ final class CalendarAutomation {
             mode: "preview",
             event: event,
             requiredEmails: roster.members.map(\.email),
-            reviewedMissingKeys: []
+            reviewedMissingKeys: [],
+            knownUID: ""
         )
         let output = try await execute(payload: payload)
         guard output.status == "preview" else {
@@ -94,8 +130,29 @@ final class CalendarAutomation {
             rosterID: roster.id,
             required: roster.members,
             missingKeys: output.missingKeys ?? [],
-            isSeries: output.isSeries ?? event.isSeries
+            isSeries: output.isSeries ?? event.isSeries,
+            locatedUID: nil
         )
+    }
+
+    /// Read-only identity resolution for the fast apply path: resolves the
+    /// event conservatively (findEvent) and returns its Calendar-scripting
+    /// uid, so a later apply can use byId instead of rescanning. Runs without
+    /// the busy guard — it never writes, and it overlaps the review dialog.
+    func locate(event: EventSnapshot) async throws -> String? {
+        let payload = try makePayload(
+            mode: "locate",
+            event: event,
+            requiredEmails: [],
+            reviewedMissingKeys: [],
+            knownUID: ""
+        )
+        let output = try await execute(payload: payload)
+        guard output.status == "located" else {
+            throw error(for: output, default: .invalidOutput("locate returned status \(output.status)"))
+        }
+        let uid = output.uid ?? ""
+        return uid.isEmpty ? nil : uid
     }
 
     func apply(review: Review) async throws -> ApplyResult {
@@ -107,7 +164,8 @@ final class CalendarAutomation {
             mode: "apply",
             event: review.event,
             requiredEmails: review.required.map(\.email),
-            reviewedMissingKeys: review.missingKeys
+            reviewedMissingKeys: review.missingKeys,
+            knownUID: review.locatedUID ?? ""
         )
         do {
             let output = try await execute(payload: payload)
@@ -118,7 +176,8 @@ final class CalendarAutomation {
                     rosterID: review.rosterID,
                     required: review.required,
                     missingKeys: output.missingKeys ?? [],
-                    isSeries: output.isSeries ?? review.isSeries
+                    isSeries: output.isSeries ?? review.isSeries,
+                    locatedUID: review.locatedUID
                 ))
             case "finished":
                 return .finished(
@@ -155,7 +214,8 @@ final class CalendarAutomation {
             mode: "preview",
             event: review.event,
             requiredEmails: review.required.map(\.email),
-            reviewedMissingKeys: []
+            reviewedMissingKeys: [],
+            knownUID: ""
         )
         guard let output = try? await execute(payload: previewPayload), output.status == "preview" else {
             throw CalendarAutomationError.unconfirmed
@@ -185,7 +245,7 @@ final class CalendarAutomation {
         let timedOut: Bool
     }
 
-    private func makePayload(mode: String, event: EventSnapshot, requiredEmails: [String], reviewedMissingKeys: [String]) throws -> ScriptPayload {
+    private func makePayload(mode: String, event: EventSnapshot, requiredEmails: [String], reviewedMissingKeys: [String], knownUID: String) throws -> ScriptPayload {
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(identifier: "UTC")
         guard !event.eventIdentifier.isEmpty, !event.calendarTitle.isEmpty else {
@@ -200,7 +260,8 @@ final class CalendarAutomation {
             isAllDay: event.isAllDay,
             isSeries: event.isSeries,
             requiredEmails: requiredEmails,
-            reviewedMissingKeys: reviewedMissingKeys
+            reviewedMissingKeys: reviewedMissingKeys,
+            knownUID: knownUID
         )
     }
 
@@ -214,6 +275,7 @@ final class CalendarAutomation {
         let isSeries: Bool
         let requiredEmails: [String]
         let reviewedMissingKeys: [String]
+        let knownUID: String
     }
 
     private func execute(payload: ScriptPayload) async throws -> ScriptOutput {

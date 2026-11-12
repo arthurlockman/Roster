@@ -206,4 +206,17 @@ final class CalendarService {
             calendarColor: event.calendar?.color.map { Color(nsColor: $0) }
         )
     }
+
+    /// Attendee email addresses for one event, read in-process via
+    /// EventKit. Returns nil when the event is gone or its attendee list
+    /// is unknown — an unknown list must never look like an empty one, so
+    /// callers fail closed to the osascript preview instead.
+    /// EKParticipant exposes its address only as a mailto: URL; keys are
+    /// normalized exactly like the script normalizes emails.
+    func attendeeEmails(forEventIdentifier identifier: String) -> [String]? {
+        guard accessState == .authorized, !identifier.isEmpty else { return nil }
+        guard let event = store.event(withIdentifier: identifier) else { return nil }
+        guard let attendees = event.attendees else { return nil }
+        return attendees.compactMap { normalizedEmailKey($0.url.absoluteString) }
+    }
 }

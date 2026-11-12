@@ -3,7 +3,11 @@
 //
 // Reads/mutates attendees only through Calendar.app scripting. Add-only:
 // attendees are appended, never removed or modified, and no RSVP is made.
-//
+// The fast preview path lives in the app (EventKit); this script still backs
+// the preview when EventKit cannot read the attendee list, and always backs
+// the write, so its reads are batched: candidate properties arrive in one
+// Apple event and attendee emails in one Apple event, with per-object reads
+// kept only as fallbacks.
 // Identity rule (amended): Calendar's scripting calendarIdentifier proved
 // unreadable on current macOS builds and scripting uids do not equal any
 // EventKit identifier, so the event is matched conservatively by
@@ -119,8 +123,8 @@ function validatePayload(payload) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         throw new Error("Invalid payload: expected an object");
     }
-    if (payload.mode !== "preview" && payload.mode !== "apply") {
-        throw new Error("Invalid payload: mode must be preview or apply");
+    if (payload.mode !== "preview" && payload.mode !== "apply" && payload.mode !== "locate") {
+        throw new Error("Invalid payload: mode must be preview, apply, or locate");
     }
     ["calendarTitle", "title", "startDate", "endDate"].forEach(function (key) {
         if (typeof payload[key] !== "string" || payload[key].length === 0) {
@@ -149,28 +153,46 @@ function validatePayload(payload) {
     if (isNaN(new Date(payload.startDate).getTime()) || isNaN(new Date(payload.endDate).getTime())) {
         throw new Error("Invalid payload: startDate/endDate must be ISO-8601");
     }
+    if (typeof payload.knownUID !== "undefined" && typeof payload.knownUID !== "string") {
+        throw new Error("Invalid payload: knownUID must be a string");
+    }
 }
 
 // ---- Calendar access ----------------------------------------------------
 
 // Exactly one writable calendar with exactly the payload calendar title.
+// Names arrive in one Apple event; only same-named candidates (rarely more
+// than one) pay a per-calendar writable check.
 function findCalendar(Calendar, payload) {
     var matches = [];
-    var all = Calendar.calendars();
-    for (var i = 0; i < all.length; i++) {
-        var name = null;
-        var writable = null;
-        try { name = all[i].name(); } catch (e) { continue; }
-        try { writable = all[i].writable(); } catch (e2) { writable = null; }
-        if (name === payload.calendarTitle && writable === true) matches.push(all[i]);
+    var names = null;
+    try { names = Calendar.calendars.name(); } catch (e) { names = null; }
+    if (names) {
+        for (var i = 0; i < names.length; i++) {
+            if (names[i] !== payload.calendarTitle) continue;
+            var writable = null;
+            try { writable = Calendar.calendars[i].writable(); } catch (e2) { writable = null; }
+            if (writable === true) matches.push(Calendar.calendars[i]);
+        }
+    } else {
+        var all = Calendar.calendars();
+        for (var j = 0; j < all.length; j++) {
+            var name = null;
+            var writable2 = null;
+            try { name = all[j].name(); } catch (e3) { continue; }
+            try { writable2 = all[j].writable(); } catch (e4) { writable2 = null; }
+            if (name === payload.calendarTitle && writable2 === true) matches.push(all[j]);
+        }
     }
     if (matches.length !== 1) throw new Error(IDENTITY_MISMATCH_MESSAGE);
     return matches[0];
 }
 
-// Plain-data meta for one scripting event; read once per candidate.
-function candidateMeta(event) {
-    var properties = event.properties();
+// Plain-data meta from one event's properties record. Shared by the bulk
+// fast path (properties fetched in one Apple event) and the per-candidate
+// fallback.
+function metaFromProperties(properties) {
+    if (!properties) return null;
     var start = properties.startDate;
     var end = properties.endDate;
     if (!(start instanceof Date) || !(end instanceof Date)) return null;
@@ -184,19 +206,66 @@ function candidateMeta(event) {
     };
 }
 
+// Plain-data meta for one scripting event; read once per candidate.
+function candidateMeta(event) {
+    var properties = null;
+    try { properties = event.properties(); } catch (e) { properties = null; }
+    if (properties === null) return null;
+    return metaFromProperties(properties);
+}
+
 // Exactly one event in the calendar matching the payload identity.
+//
+// Fast path: `knownUID` was captured by a read-only locate run earlier in
+// this flow. byId resolves in milliseconds while a whose scan costs
+// seconds-to-minutes on large calendars, so apply should almost always take
+// the fast path. The identity check still runs on the byId-resolved event,
+// so a stale or wrong uid can only cost the fallback scan — never a wrong
+// write.
+//
+// Non-series payloads match by exact instants, so the scan can be
+// date-windowed server-side: Calendar returns a handful of candidates even
+// in a calendar with years of history. Calendar's whose evaluator rejects
+// _greaterThanOrEquals/_lessThanOrEquals on dates (-1726) but accepts strict
+// _greaterThan/_lessThan, so the bounds are widened instead. Series targets
+// are recurring masters whose anchor can be arbitrarily old — those keep the
+// title-only scan.
 function findEvent(calendar, payload) {
+    if (typeof payload.knownUID === "string" && payload.knownUID.length > 0) {
+        var cached = null;
+        try { cached = calendar.events.byId(payload.knownUID); } catch (e) { cached = null; }
+        if (cached) {
+            var cachedMeta = null;
+            try { cachedMeta = candidateMeta(cached); } catch (e2) { cachedMeta = null; }
+            if (cachedMeta !== null && matchCandidates([cachedMeta], payload).length === 1) {
+                return cached;
+            }
+        }
+        // Stale or wrong uid: fall through to the full conservative match.
+    }
+
+    var conditions = [{ summary: { _equals: payload.title } }];
+    if (!payload.isSeries) {
+        var payloadStart = new Date(payload.startDate);
+        var lo = new Date(payloadStart.getTime() - 3 * 86400000);
+        var hi = new Date(payloadStart.getTime() + 3 * 86400000);
+        conditions.push({ startDate: { _greaterThan: lo } });
+        conditions.push({ startDate: { _lessThan: hi } });
+    }
     var candidates;
     try {
-        candidates = calendar.events.whose({ summary: { _equals: payload.title } })();
-    } catch (e) {
-        candidates = calendar.events();
+        candidates = calendar.events.whose({ _and: conditions })();
+    } catch (e3) {
+        try {
+            candidates = calendar.events.whose({ summary: { _equals: payload.title } })();
+        } catch (e4) {
+            candidates = calendar.events();
+        }
     }
     var metas = [];
     var events = [];
     for (var i = 0; i < candidates.length; i++) {
-        var meta = null;
-        try { meta = candidateMeta(candidates[i]); } catch (e2) { meta = null; }
+        var meta = candidateMeta(candidates[i]);
         if (meta !== null) {
             metas.push(meta);
             events.push(candidates[i]);
@@ -214,17 +283,27 @@ function seriesFlag(event) {
 }
 
 // Reading attendees must succeed or everything fails: a read failure is never
-// treated as "no attendees".
+// treated as "no attendees". Fast path asks for every attendee's email in one
+// Apple event; per-attendee reads remain as the fallback.
 function readAttendeeEmails(event) {
+    var bulk = null;
+    try { bulk = event.attendees.email()(); } catch (e) { bulk = null; }
+    if (bulk) {
+        var emails = [];
+        for (var i = 0; i < bulk.length; i++) {
+            emails.push(bulk[i] == null ? "" : String(bulk[i]));
+        }
+        return emails;
+    }
     var attendees = event.attendees();
-    var emails = [];
+    var fallback = [];
     if (attendees) {
-        for (var i = 0; i < attendees.length; i++) {
-            var email = attendees[i].email();
-            emails.push(email == null ? "" : String(email));
+        for (var j = 0; j < attendees.length; j++) {
+            var email = attendees[j].email();
+            fallback.push(email == null ? "" : String(email));
         }
     }
-    return emails;
+    return fallback;
 }
 
 function output(status, fields) {
@@ -236,7 +315,8 @@ function output(status, fields) {
         addedEmails: fields.addedEmails || [],
         remainingEmails: fields.remainingEmails || [],
         warning: fields.warning === undefined ? null : fields.warning,
-        message: fields.message === undefined ? null : fields.message
+        message: fields.message === undefined ? null : fields.message,
+        uid: fields.uid || ""
     };
     return JSON.stringify(result);
 }
@@ -255,6 +335,16 @@ function run(argv) {
         var event = findEvent(calendar, payload);
 
         var isSeries = seriesFlag(event);
+
+        // Locate is a read-only identity resolution for the app's fast apply:
+        // the matched event's scripting uid, so a later apply can resolve it
+        // with byId instead of rescanning. No attendees are read here.
+        if (payload.mode === "locate") {
+            var uid = null;
+            try { uid = event.uid(); } catch (e0) { uid = null; }
+            return output("located", { uid: uid == null ? "" : String(uid), isSeries: isSeries });
+        }
+
         var attendeeEmails = readAttendeeEmails(event);
         var missing = missingEmailKeys(payload.requiredEmails, attendeeEmails);
 

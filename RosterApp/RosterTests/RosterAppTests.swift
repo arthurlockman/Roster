@@ -61,6 +61,66 @@ struct ScriptHelperTests {
         #expect(try call(context, "normalizeEmail", ["  MAILTO: User@Example.COM "]).toString() == "user@example.com")
         #expect(try call(context, "normalizeEmail", ["   "]).isNull)
     }
+
+    @Test func metaFromPropertiesReadsBulkRecord() throws {
+        let context = try makeContext()
+        let record: [String: Any] = [
+            "summary": "Established Patient Return",
+            "alldayEvent": false,
+            "startDate": Date(timeIntervalSince1970: 1_700_000_000),
+            "endDate": Date(timeIntervalSince1970: 1_700_003_600),
+            "recurrence": "",
+        ]
+        let meta = try call(context, "metaFromProperties", [record]).toDictionary()
+        #expect(meta?["summary"] as? String == "Established Patient Return")
+        #expect(meta?["allDay"] as? Bool == false)
+        #expect(meta?["hasRecurrence"] as? Bool == false)
+        #expect(meta?["start"] != nil)
+        #expect(meta?["end"] != nil)
+    }
+
+    @Test func metaFromPropertiesRejectsMissingDates() throws {
+        let context = try makeContext()
+        let record: [String: Any] = ["summary": "x", "alldayEvent": true]
+        let meta = try call(context, "metaFromProperties", [record]).toDictionary()
+        #expect(meta == nil || (meta?.isEmpty ?? true))
+    }
+}
+
+/// The Swift twin used by the EventKit preview fast path must agree with the
+/// script's missingEmailKeys: same normalization, required order, dedupe.
+@Suite("missingKeys Swift twin")
+struct MissingKeysTests {
+    @Test func ignoresMailtoCaseAndWhitespace() {
+        #expect(
+            missingKeys(
+                required: ["  DR@example.com ", "mailto:nurse@clinic.org"],
+                attendeeEmails: ["dr@EXAMPLE.com"]
+            ) == ["nurse@clinic.org"]
+        )
+    }
+
+    @Test func duplicateRequiredEmailsAppearOnce() {
+        #expect(
+            missingKeys(
+                required: ["a@x.org", "A@X.ORG", "mailto:a@x.org"],
+                attendeeEmails: []
+            ) == ["a@x.org"]
+        )
+    }
+
+    @Test func emptyAndInvalidRequiredEmailsAreSkipped() {
+        #expect(missingKeys(required: ["", "   "], attendeeEmails: []) == [])
+    }
+
+    @Test func keepsRequiredOrder() {
+        #expect(
+            missingKeys(
+                required: ["c@x.org", "a@x.org", "b@x.org"],
+                attendeeEmails: ["a@x.org"]
+            ) == ["c@x.org", "b@x.org"]
+        )
+    }
 }
 
 /// Exercises the app-owned JSON persistence: round-trip, corrupted-file
