@@ -62,8 +62,17 @@ final class CalendarService {
     private(set) var fetchError: String?
     private(set) var day: Date = Calendar.current.startOfDay(for: .now)
 
-    private let store = EKEventStore()
+    /// Base store: authorization and source discovery. Its `sources` exclude
+    /// delegate sources.
+    private let baseStore = EKEventStore()
+    /// Store scoped to ordinary + delegate sources; rebuilt whenever the set
+    /// of delegate sources changes. Apple's documented path for delegated
+    /// calendars (EKEventStore.delegateSources + init(sources:)).
+    private var scopedStore: EKEventStore?
+    private var scopedSourceIDs: Set<String> = []
     private var observers: [any NSObjectProtocol] = []
+
+    private var activeStore: EKEventStore { scopedStore ?? baseStore }
 
     private static let selectionKey = "selectedCalendarIdentifiers"
 
@@ -71,7 +80,7 @@ final class CalendarService {
         selectedCalendarIDs = Set(UserDefaults.standard.stringArray(forKey: Self.selectionKey) ?? [])
         observers.append(
             NotificationCenter.default.addObserver(
-                forName: .EKEventStoreChanged, object: store, queue: .main
+                forName: .EKEventStoreChanged, object: nil, queue: .main
             ) { [weak self] _ in
                 // Documented EventKit rule: cached EKEvent objects are
                 // invalidated by store changes; refetch everything.
@@ -99,7 +108,7 @@ final class CalendarService {
             accessState = .authorized
         case .notDetermined:
             do {
-                let granted = try await store.requestFullAccessToEvents()
+                let granted = try await baseStore.requestFullAccessToEvents()
                 accessState = granted ? .authorized : .denied
             } catch {
                 accessState = .denied
@@ -148,7 +157,16 @@ final class CalendarService {
 
     private func refetchCalendarsAndEvents() async {
         guard accessState == .authorized else { return }
-        calendars = store.calendars(for: .event)
+        // Apple's documented path for delegated calendars: the default store
+        // excludes delegate sources, so a second store scoped to ordinary +
+        // delegate sources exposes them (EKEventStore.delegateSources).
+        // Rebuild when the delegate set changes.
+        let delegateIDs = Set(baseStore.delegateSources.map(\.sourceIdentifier))
+        if scopedStore == nil || delegateIDs != scopedSourceIDs {
+            scopedStore = EKEventStore(sources: baseStore.sources + baseStore.delegateSources)
+            scopedSourceIDs = delegateIDs
+        }
+        calendars = activeStore.calendars(for: .event)
         // First run: show everything, so the day list is never mysteriously
         // empty. Afterwards the user's explicit selection wins; a calendar
         // added later is not auto-selected.
@@ -177,8 +195,8 @@ final class CalendarService {
         let start = calendar.startOfDay(for: day)
         // Next calendar day, never a fixed 86,400-second window (DST-safe).
         let end = calendar.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(86_400)
-        let predicate = store.predicateForEvents(withStart: start, end: end, calendars: targets)
-        let matches = store.events(matching: predicate)
+        let predicate = activeStore.predicateForEvents(withStart: start, end: end, calendars: targets)
+        let matches = activeStore.events(matching: predicate)
         let snapshots = matches.map { Self.snapshot(of: $0) }
         events = snapshots.sorted { a, b in
             if a.isAllDay != b.isAllDay { return a.isAllDay }
@@ -215,7 +233,7 @@ final class CalendarService {
     /// normalized exactly like the script normalizes emails.
     func attendeeEmails(forEventIdentifier identifier: String) -> [String]? {
         guard accessState == .authorized, !identifier.isEmpty else { return nil }
-        guard let event = store.event(withIdentifier: identifier) else { return nil }
+        guard let event = activeStore.event(withIdentifier: identifier) else { return nil }
         guard let attendees = event.attendees else { return nil }
         return attendees.compactMap { normalizedEmailKey($0.url.absoluteString) }
     }
