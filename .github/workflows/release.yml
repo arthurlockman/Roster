@@ -144,6 +144,7 @@ jobs:
             -clonedSourcePackagesDirPath build/SourcePackages \
             "${sign_args[@]}" \
             CURRENT_PROJECT_VERSION="${{ steps.buildnum.outputs.value }}" \
+            MARKETING_VERSION="${{ steps.version.outputs.value }}" \
             | tee build/archive.log
 
       # ── Export ─────────────────────────────────────────────────
