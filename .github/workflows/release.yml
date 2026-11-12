@@ -147,6 +147,20 @@ jobs:
           echo "Minimum system version: $v"
 
 
+      # ── Distributability gate ──────────────────────────────────
+      # Only a signed AND notarized build may reach end-user updaters
+      # through the Sparkle feed; anything less stays GitHub-only.
+      - name: Determine distributability
+        id: distributable
+        run: |
+          if [[ -n "$DEVELOPER_ID_P12_BASE64" && -n "$NOTARY_KEY" ]]; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+            echo "Build will be signed and notarized — appcast will be updated."
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Missing DEVELOPER_ID_P12_BASE64 and/or NOTARY_KEY — skipping Sparkle appcast update (build is not distributable)."
+          fi
+
       # ── Package ────────────────────────────────────────────────
       - name: Create release zip
         run: |
@@ -194,7 +208,7 @@ jobs:
       # Downloads Sparkle's release tarball for its sign_update tool;
       # independent of whether the app itself embeds Sparkle yet.
       - name: Download Sparkle signing tools
-        if: env.SPARKLE_PRIVATE_KEY != ''
+        if: env.SPARKLE_PRIVATE_KEY != '' && steps.distributable.outputs.value == 'true'
         run: |
           curl -L -o sparkle.tar.xz \
             "https://github.com/sparkle-project/Sparkle/releases/download/${{ env.SPARKLE_VERSION }}/Sparkle-${{ env.SPARKLE_VERSION }}.tar.xz"
@@ -202,7 +216,7 @@ jobs:
           ls -d Sparkle-*/bin/sign_update
 
       - name: Sign update for Sparkle
-        if: env.SPARKLE_PRIVATE_KEY != ''
+        if: env.SPARKLE_PRIVATE_KEY != '' && steps.distributable.outputs.value == 'true'
         id: sparkle
         run: |
           version="${{ steps.version.outputs.value }}"
@@ -252,7 +266,7 @@ jobs:
 
       # ── Update Sparkle appcast (optional) ──────────────────────
       - name: Update and publish appcast
-        if: env.SPARKLE_PRIVATE_KEY != ''
+        if: env.SPARKLE_PRIVATE_KEY != '' && steps.distributable.outputs.value == 'true'
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.value }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
