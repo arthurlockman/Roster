@@ -113,6 +113,7 @@ jobs:
       # unsigned ad-hoc build so a no-secrets dry run still passes.
       - name: Build Release app
         run: |
+          mkdir -p build
           set -o pipefail
           sign_args=()
           if [[ -n "$DEVELOPER_ID_P12_BASE64" ]]; then
