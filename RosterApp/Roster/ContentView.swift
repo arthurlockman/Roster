@@ -841,7 +841,9 @@ private struct PasteSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Paste invitee list").font(.title3.bold())
-            Text("Comma- or newline-separated. Bare addresses or \"Firstname Lastname <email@host>\".")
+            // Text(verbatim:) — a plain Text("…") literal parses markdown,
+            // which turns <email@host> into an autolink and eats the brackets.
+            Text(verbatim: "Comma- or newline-separated. Bare addresses or \"Firstname Lastname <email@host>\".")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

@@ -28,7 +28,7 @@ struct RosterApp: App {
             ContentView(model: model)
         }
         .commands {
-            CommandMenu("Updates") {
+            CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") {
                     updaterController.checkForUpdates(nil)
                 }
