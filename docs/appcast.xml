@@ -6,6 +6,12 @@
         <description>Most recent Roster releases</description>
         <language>en</language>
         <item>
+    <title>Version 1.1.1</title>
+    <pubDate>Thu, 12 Nov 2026 04:43:00 +0000</pubDate>
+    <enclosure url="https://github.com/arthurlockman/Roster/releases/download/v1.1.1/Roster-1.1.1.zip" sparkle:version="111" sparkle:shortVersionString="1.1.1" length="3452616" type="application/octet-stream" sparkle:edSignature="HEm000zj2nBzNOc1PYaVelFjSKqIrEWlxqFRgqxiJHXgrISU6Az6UUEs50zkioZg272Ux9jmTYBObUV8cD9DCQ==" />
+    <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+</item>
+        <item>
     <title>Version 1.1</title>
     <pubDate>Thu, 12 Nov 2026 04:09:39 +0000</pubDate>
     <enclosure url="https://github.com/arthurlockman/Roster/releases/download/v1.1/Roster-1.1.zip" sparkle:version="108" sparkle:shortVersionString="1.1" length="3438654" type="application/octet-stream" sparkle:edSignature="ppbPKlAVCbQd7O01XTe0sFy2GQbW8wmpjyhMekgx02yI430jOKBgjDx+iLLCjzV2n0ha7rIqi7+gMjgdtAsJAQ==" />
