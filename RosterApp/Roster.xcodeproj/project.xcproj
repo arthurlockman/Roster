@@ -10,6 +10,15 @@
       "Base",
     ],
   },
+  "packages": [
+    {
+      "kind": "remote",
+      "repository": "https://github.com/sparkle-project/Sparkle",
+      "version": {
+        "up-to-next-major-version": "2.10.1",
+      },
+    },
+  ],
   "files": [
     { "kind": "folder", "path": "Roster", "target-membership": [ "Roster" ] },
     { "kind": "folder", "path": "RosterTests", "target-membership": [ "RosterTests" ] },
@@ -33,6 +42,13 @@
         "frameworks",
         "resources",
       ],
+      "package-product-members": [
+        {
+          "package": "Sparkle",
+          "product-name": "Sparkle",
+          "build-phase": { "build-phase": "frameworks" },
+        },
+      ],
       "build-settings": {
         "ASSETCATALOG_COMPILER_APPICON_NAME": "RosterIcon",
         "ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME": "AccentColor",
@@ -54,6 +70,7 @@
         "ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY": "NO",
         "ENABLE_USER_SELECTED_FILES": "readonly",
         "GENERATE_INFOPLIST_FILE": "YES",
+        "INFOPLIST_FILE": "Roster/Info.plist",
         "INFOPLIST_KEY_CFBundleDisplayName": "Roster",
         "INFOPLIST_KEY_LSApplicationCategoryType": "public.app-category.productivity",
         "INFOPLIST_KEY_NSAppleEventsUsageDescription": "Add confirmed missing invitees to events in Calendar.",
