@@ -213,6 +213,168 @@ struct RosterStoreTests {
         let reopened = RosterStore(directory: dir)
         #expect(reopened.rosters.map(\.name) == ["B"])
     }
+
+    // MARK: - Folder sharing
+
+    @Test func switchToEmptyDestinationPublishesCurrentLibrary() throws {
+        let source = try makeTempDirectory()
+        let destination = try makeTempDirectory()
+        let store = RosterStore(directory: source)
+        let roster = try store.createRoster(named: "Team")
+        let sourceBytes = try Data(contentsOf: source.appendingPathComponent("rosters.json"))
+
+        try store.switchDirectory(to: destination)
+
+        #expect(store.directory == destination.resolvingSymlinksInPath().standardizedFileURL)
+        #expect(store.rosters.map(\.id) == [roster.id])
+        #expect(store.persistentError == nil)
+        #expect(try readFile(destination).contains("Team"), "current library must be published in the target folder")
+        #expect(try Data(contentsOf: source.appendingPathComponent("rosters.json")) == sourceBytes,
+                "the former file must stay untouched")
+        let reopened = RosterStore(directory: destination, requireExistingFile: true)
+        #expect(reopened.rosters.map(\.name) == ["Team"])
+    }
+
+    @Test func populatedDestinationIsAdoptedAndBothFilesPreserved() throws {
+        let source = try makeTempDirectory()
+        let destination = try makeTempDirectory()
+        let store = RosterStore(directory: source)
+        try store.createRoster(named: "Mine")
+        let other = RosterStore(directory: destination)
+        try other.createRoster(named: "Theirs")
+        let destinationBytes = try Data(contentsOf: destination.appendingPathComponent("rosters.json"))
+        let sourceBytes = try Data(contentsOf: source.appendingPathComponent("rosters.json"))
+
+        try store.switchDirectory(to: destination)
+
+        #expect(store.rosters.map(\.name) == ["Theirs"], "joining a populated folder adopts its library")
+        #expect(store.persistentError == nil)
+        #expect(try Data(contentsOf: destination.appendingPathComponent("rosters.json")) == destinationBytes,
+                "the adopted file must not be overwritten")
+        #expect(try Data(contentsOf: source.appendingPathComponent("rosters.json")) == sourceBytes,
+                "the former file must stay untouched")
+    }
+
+    @Test func corruptDestinationRefusesSwitchWithoutChanges() throws {
+        let source = try makeTempDirectory()
+        let destination = try makeTempDirectory()
+        let store = RosterStore(directory: source)
+        try store.createRoster(named: "Mine")
+        let garbage = "{ this is not valid roster json ]["
+        try garbage.write(to: destination.appendingPathComponent("rosters.json"), atomically: true, encoding: .utf8)
+        let sourceBytes = try Data(contentsOf: source.appendingPathComponent("rosters.json"))
+        let resolvedDestination = destination.resolvingSymlinksInPath().standardizedFileURL
+
+        #expect(throws: RosterStoreError.corruptData(path: resolvedDestination.appendingPathComponent("rosters.json").path)) {
+            try store.switchDirectory(to: destination)
+        }
+        #expect(store.rosters.map(\.name) == ["Mine"], "selection and rosters unchanged after a refused switch")
+        #expect(store.directory == source.resolvingSymlinksInPath().standardizedFileURL)
+        #expect(store.persistentError == nil)
+        #expect(try String(contentsOf: destination.appendingPathComponent("rosters.json"), encoding: .utf8) == garbage,
+                "corrupt target file must be left untouched")
+        #expect(try Data(contentsOf: source.appendingPathComponent("rosters.json")) == sourceBytes)
+    }
+
+    @Test func selectedFolderMustExistWithValidFile() throws {
+        let missingDir = try makeTempDirectory().appendingPathComponent("does-not-exist")
+        let unavailable = RosterStore(directory: missingDir, requireExistingFile: true)
+        guard case .unavailableDirectory = unavailable.persistentError else {
+            Issue.record("expected unavailableDirectory, got \(String(describing: unavailable.persistentError))")
+            return
+        }
+        #expect(unavailable.rosters.isEmpty)
+        #expect(throws: RosterStoreError.self) { _ = try unavailable.createRoster(named: "blocked") }
+
+        let emptyFolder = try makeTempDirectory()
+        let noFile = RosterStore(directory: emptyFolder, requireExistingFile: true)
+        guard case .missingSelectedFile = noFile.persistentError else {
+            Issue.record("expected missingSelectedFile, got \(String(describing: noFile.persistentError))")
+            return
+        }
+        #expect(noFile.rosters.isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: emptyFolder.appendingPathComponent("rosters.json").path),
+                "a missing selected file must not be silently recreated")
+    }
+
+    @Test func vanishedSelectedFileBlocksEditsUntilRestored() throws {
+        let dir = try makeTempDirectory()
+        let store = RosterStore(directory: dir)
+        try store.createRoster(named: "A")
+        let fileURL = dir.appendingPathComponent("rosters.json")
+        let bytes = try Data(contentsOf: fileURL)
+        try FileManager.default.removeItem(at: fileURL)
+
+        store.reload()
+        guard case .missingSelectedFile = store.persistentError else {
+            Issue.record("expected missingSelectedFile, got \(String(describing: store.persistentError))")
+            return
+        }
+        #expect(store.rosters.map(\.name) == ["A"], "last good rosters stay visible while blocked")
+        #expect(throws: RosterStoreError.self) { _ = try store.createRoster(named: "B") }
+        #expect(!FileManager.default.fileExists(atPath: fileURL.path), "blocked edits must not recreate the file")
+
+        try bytes.write(to: fileURL)
+        store.reload()
+        #expect(store.persistentError == nil, "recovery clears the blocking error")
+        #expect(store.rosters.map(\.name) == ["A"])
+        _ = try store.createRoster(named: "B")
+        #expect(store.rosters.map(\.name) == ["A", "B"])
+    }
+
+    @Test func reloadPicksUpSecondStoreChanges() throws {
+        let dir = try makeTempDirectory()
+        let first = RosterStore(directory: dir)
+        _ = try first.createRoster(named: "First")
+        let second = RosterStore(directory: dir)
+        let added = try second.createRoster(named: "Second")
+
+        first.reload()
+
+        #expect(first.persistentError == nil)
+        #expect(first.rosters.map(\.name) == ["First", "Second"])
+        #expect(first.rosters.last?.id == added.id)
+    }
+
+    @Test func staleEditThrowsAndSucceedsAfterReload() throws {
+        let dir = try makeTempDirectory()
+        let first = RosterStore(directory: dir)
+        _ = try first.createRoster(named: "A")
+        let second = RosterStore(directory: dir)
+        _ = try second.createRoster(named: "B")
+
+        #expect(throws: RosterStoreError.self) { _ = try first.createRoster(named: "Stale") }
+        let afterStale = RosterStore(directory: dir)
+        #expect(afterStale.rosters.map(\.name) == ["A", "B"], "the stale edit must not overwrite the newer file")
+
+        first.reload()
+        #expect(first.persistentError == nil)
+        #expect(first.rosters.map(\.name) == ["A", "B"])
+        _ = try first.createRoster(named: "Stale")
+        #expect(first.rosters.map(\.name) == ["A", "B", "Stale"])
+
+        let reopened = RosterStore(directory: dir)
+        #expect(reopened.rosters.map(\.name) == ["A", "B", "Stale"])
+    }
+
+    @Test func brokenSourceCanRecoverIntoPopulatedTarget() throws {
+        let source = try makeTempDirectory()
+        let destination = try makeTempDirectory()
+        let store = RosterStore(directory: source)
+        try store.createRoster(named: "Broken")
+        let other = RosterStore(directory: destination)
+        try other.createRoster(named: "Good")
+        try "{ corrupt ][".write(to: source.appendingPathComponent("rosters.json"), atomically: true, encoding: .utf8)
+        store.reload()
+        #expect(store.persistentError != nil, "precondition: source is blocked")
+
+        try store.switchDirectory(to: destination)
+
+        #expect(store.persistentError == nil)
+        #expect(store.rosters.map(\.name) == ["Good"])
+        let reopened = RosterStore(directory: destination, requireExistingFile: true)
+        #expect(reopened.rosters.map(\.name) == ["Good"])
+    }
 }
 
 /// Exercises the amended identity rule: writable calendar by exact title +

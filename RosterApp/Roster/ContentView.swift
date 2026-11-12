@@ -8,6 +8,8 @@ struct ContentView: View {
     @State private var showingOnboarding = false
 
     /// Set after the first-run walkthrough finishes or is skipped.
+    @State private var showingStorageSheet = false
+    @Environment(\.scenePhase) private var scenePhase
     static let onboardingSeenKey = "hasSeenOnboarding"
 
     var body: some View {
@@ -30,12 +32,32 @@ struct ContentView: View {
                 showingOnboarding = true
             }
         }
+        .task {
+            // Foreground polling: pick up changes other instances/devices
+            // make to the shared file; the task is cancelled when the
+            // window closes. The pre-save disk comparison in the store is
+            // still what guards against stale writes.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                model.rosterStore.reload()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // Catch up immediately after the app was backgrounded or another
+            // instance saved while we were inactive.
+            if phase == .active {
+                model.rosterStore.reload()
+            }
+        }
         .sheet(isPresented: $showingOnboarding) {
             OnboardingSheet {
                 UserDefaults.standard.set(true, forKey: Self.onboardingSeenKey)
                 showingOnboarding = false
                 Task { await model.requestPermissions() }
             }
+        }
+        .sheet(isPresented: $showingStorageSheet) {
+            StorageSheet(model: model)
         }
         .sheet(isPresented: BindableSheet(model, keyPath: \.showsFlowSheet)) {
             switch model.flow {
@@ -145,6 +167,13 @@ struct ContentView: View {
                         .foregroundStyle(.red)
                 }
                 Button {
+                    showingStorageSheet = true
+                } label: {
+                    Label("Storage…", systemImage: "folder")
+                }
+                .disabled(!model.canChangeStorageDirectory)
+                .help("Choose where rosters.json lives")
+                Button {
                     showingOnboarding = true
                 } label: {
                     Label("How to use", systemImage: "questionmark.circle")
@@ -189,6 +218,68 @@ struct ContentView: View {
             Button("Open System Settings") { Self.openPrivacySettings() }
         }
         .padding(.horizontal)
+    }
+}
+
+/// Sheet for choosing where rosters.json lives. Shows the active folder,
+/// lets the user pick any directory (including creating a new one), or
+/// return to the default Application Support location. Cancel and picker
+/// dismissal change nothing; switching adopts a populated folder's library
+/// and publishes the current one into an empty folder.
+private struct StorageSheet: View {
+    @Bindable var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Roster storage").font(.title2).bold()
+
+            VStack(alignment: .leading, spacing: 4) {
+                Label(model.rosterStore.directory.path, systemImage: "folder")
+                    .textSelection(.enabled)
+                Text("Library file: rosters.json")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let persistentError = model.rosterStore.persistentError {
+                Label(persistentError.errorDescription ?? "Storage problem",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+            }
+
+            Text("Choosing a different folder adopts that folder's rosters.json as the library shown here; your previous file is left untouched. Everyone with access to the folder sees the same rosters.")
+                .font(.callout)
+            Text("Edits are shared sequentially: each save checks the file and refuses to apply when it changed elsewhere — reload, then retry. Keep one person editing at a time. Sync providers (Dropbox, Box, iCloud Drive) may still create conflict copies when offline edits collide; Roster does not merge them and does not provide live multi-writer collaboration.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+            HStack {
+                Button("Choose Folder…") { chooseFolder() }
+                Button("Use Default Location") {
+                    if model.useDefaultRosterDirectory() { dismiss() }
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(minWidth: 460, minHeight: 280)
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = model.rosterStore.directory
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if model.changeRosterDirectory(to: url) {
+            dismiss()
+        }
     }
 }
 

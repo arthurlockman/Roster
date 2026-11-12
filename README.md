@@ -4,7 +4,8 @@ Roster is a macOS app for managing invitee sets and filling out event invitation
 
 ## Features
 
-- **Rosters** — named, editable invitee sets stored locally (`~/Library/Application Support/RosterApp/rosters.json`). Members are snapshotted by email at the time you add them, so later edits in Contacts never silently change who gets invited.
+- **Rosters** — named, editable invitee sets stored in one `rosters.json` file (by default in `~/Library/Application Support/RosterApp/`). Members are snapshotted by email at the time you add them, so later edits in Contacts never silently change who gets invited.
+- **Shared storage folder** — move the library to any folder (Dropbox, Box, iCloud Drive, or local) via the **Storage…** button in the roster pane. Everyone with access to that folder sees the same rosters; joining a populated folder adopts its `rosters.json`, and your previous file is left untouched. Edits are sequential: each save checks the file and refuses to apply when it changed elsewhere, so reload and retry. Sync providers may still create conflict copies when offline edits collide — Roster does not merge them.
 - **Calendar day view** — pick which calendars to read, navigate previous/today/next, and see events sorted all-day-first with their current invitee counts.
 - **Drag-to-event preview** — dragging a roster onto an event shows exactly which roster members are *not* yet invited before anything is written. If everyone is already there, it says so.
 - **Add-only invitee addition** — confirming adds only the missing addresses. Existing invitees (accepted, declined, tentative, or pending) are never touched, removed, or re-RSVP'd.

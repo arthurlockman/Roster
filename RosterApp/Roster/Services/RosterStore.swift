@@ -3,6 +3,11 @@ import Observation
 
 enum RosterStoreError: LocalizedError, Equatable {
     case corruptData(path: String)
+    case readFailed(path: String, underlying: String)
+    case unavailableDirectory(path: String)
+    case missingSelectedFile(path: String)
+    case changedOnDisk(path: String)
+    case targetAppeared(path: String)
     case writeFailed(underlying: String)
     case blankName
     case duplicateEmail(String)
@@ -13,6 +18,16 @@ enum RosterStoreError: LocalizedError, Equatable {
         switch self {
         case .corruptData(let path):
             return "Roster data at \(path) could not be read. Fix or remove the file; Roster has not overwritten it."
+        case .readFailed(let path, let underlying):
+            return "rosters.json in \(path) could not be read: \(underlying). Roster has not overwritten it."
+        case .unavailableDirectory(let path):
+            return "The roster folder at \(path) is not available. Restore or reconnect the folder; Roster will not treat it as an empty library."
+        case .missingSelectedFile(let path):
+            return "rosters.json is missing from \(path). Restore the file or choose another folder; Roster has not recreated it."
+        case .changedOnDisk(let path):
+            return "rosters.json in \(path) was changed by another instance or device. Your edit was not applied; the latest data is now shown, so try again."
+        case .targetAppeared(let path):
+            return "A rosters.json appeared in \(path) during the switch. Nothing was changed; review the folder and try again."
         case .writeFailed(let underlying):
             return "Saving rosters failed: \(underlying)"
         case .blankName:
@@ -28,23 +43,46 @@ enum RosterStoreError: LocalizedError, Equatable {
 }
 
 /// Owns the saved rosters. File-on-disk rules:
-/// - Missing file means zero rosters, not an error.
-/// - Undecodable file surfaces a blocking error and is never overwritten by us.
-/// - Mutations revert in memory when their save fails, so the view model never
-///   drifts from what is actually on disk.
+/// - A fresh default library (no file seen yet) treats a missing file as
+///   zero rosters, not an error.
+/// - A previously selected folder must exist and contain a readable, valid
+///   rosters.json; an unavailable folder, unreadable file, corrupt JSON, or
+///   a vanished once-seen file surfaces a blocking error and is never
+///   overwritten or silently treated as an empty library.
+/// - Mutations first compare the file against the last bytes this store
+///   read or wrote and refuse to apply a stale edit when another writer
+///   (a second instance or a synced device) saved meanwhile. This detects
+///   local staleness only; sync providers may still create conflict copies
+///   when offline clients edit simultaneously.
+/// - Mutations revert in memory when their save fails, so the view model
+///   never drifts from what is actually on disk.
 @Observable
 final class RosterStore {
     private(set) var rosters: [Roster] = []
     /// Non-nil means a load or save failure the UI must surface as blocking.
     private(set) var persistentError: RosterStoreError?
-
-    private let directory: URL
+    /// The folder currently holding `rosters.json`; changes only via
+    /// `switchDirectory(to:)`.
+    private(set) var directory: URL
     private var fileURL: URL { directory.appendingPathComponent("rosters.json") }
+    /// Exact bytes of the last file state this store read or wrote, used to
+    /// detect out-of-band changes. Nil while no file has been seen here.
+    private var lastSeenBytes: Data?
+    /// True once a rosters.json has been read or written at the current
+    /// location (or the folder was opened as a previously selected one).
+    /// While false, a missing file is just an empty default library.
+    private var fileExpected = false
 
     /// `directory` is injectable so tests can exercise persistence without
-    /// touching the user's real Application Support.
-    init(directory: URL? = nil) {
-        self.directory = directory ?? Self.defaultDirectory()
+    /// touching the user's real Application Support. `requireExistingFile`
+    /// marks a previously selected folder: its file must already exist and
+    /// be valid, and a missing file is an error rather than an empty library.
+    init(directory: URL? = nil, requireExistingFile: Bool = false) {
+        self.directory = (directory ?? Self.defaultDirectory())
+            .resolvingSymlinksInPath().standardizedFileURL
+        if requireExistingFile {
+            fileExpected = true
+        }
         reload()
     }
 
@@ -62,22 +100,81 @@ final class RosterStore {
         return appDir
     }
 
-    /// Re-reads the file. Corrupt data keeps the empty in-memory list and sets
-    /// the blocking error; the on-disk file is left untouched.
+    /// Re-reads the file. A changed file replaces the visible rosters;
+    /// failures keep the last good rosters and set the blocking error. The
+    /// on-disk file is never overwritten by a failed read.
     func reload() {
-        guard (try? FileManager.default.attributesOfItem(atPath: fileURL.path)) != nil else {
+        do {
+            try refresh()
+        } catch let error as RosterStoreError {
+            persistentError = error
+        } catch {
+            persistentError = .readFailed(
+                path: fileURL.path, underlying: error.localizedDescription)
+        }
+    }
+
+    /// Core read; throws instead of blocking. Assigns visible state only on
+    /// success, and is a no-op when the bytes match what we last saw and no
+    /// error is pending.
+    private func refresh() throws {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw RosterStoreError.unavailableDirectory(path: directory.path)
+        }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            if fileExpected {
+                throw RosterStoreError.missingSelectedFile(path: fileURL.path)
+            }
             rosters = []
+            lastSeenBytes = nil
             persistentError = nil
             return
         }
+        let data: Data
         do {
-            let data = try Data(contentsOf: fileURL)
-            rosters = try JSONDecoder().decode([Roster].self, from: data)
-            persistentError = nil
+            data = try Data(contentsOf: fileURL)
         } catch {
-            rosters = []
-            persistentError = .corruptData(path: fileURL.path)
+            throw RosterStoreError.readFailed(path: fileURL.path, underlying: error.localizedDescription)
         }
+        let decoded: [Roster]
+        do {
+            decoded = try JSONDecoder().decode([Roster].self, from: data)
+        } catch {
+            throw RosterStoreError.corruptData(path: fileURL.path)
+        }
+        if persistentError == nil, data == lastSeenBytes {
+            return
+        }
+        rosters = decoded
+        lastSeenBytes = data
+        fileExpected = true
+        persistentError = nil
+    }
+
+    /// Returns true when the on-disk file differs from the last bytes this
+    /// store read or wrote. Throws blocking errors for an unavailable
+    /// folder, unreadable file, or a vanished once-seen file.
+    private func diskChangedExternally() throws -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw RosterStoreError.unavailableDirectory(path: directory.path)
+        }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            if fileExpected {
+                throw RosterStoreError.missingSelectedFile(path: fileURL.path)
+            }
+            return lastSeenBytes != nil
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            throw RosterStoreError.readFailed(path: fileURL.path, underlying: error.localizedDescription)
+        }
+        return data != lastSeenBytes
     }
 
     // MARK: - Mutations (each mutation saves; failures roll back the change)
@@ -209,11 +306,23 @@ final class RosterStore {
         return name
     }
 
-    /// Runs a mutation and saves. Any thrown error aborts before the in-memory
-    /// change; a save failure rolls the change back so memory matches disk.
+    /// Runs a mutation and saves. First adopts or rejects out-of-band disk
+    /// changes; any thrown error aborts before the in-memory change; a save
+    /// failure rolls the change back so memory matches disk.
     private func mutate<T>(_ validation: () throws -> T, then commit: (T) throws -> Void) throws {
         if let pendingError = persistentError {
             throw pendingError
+        }
+        do {
+            try adoptOrRejectExternalChanges()
+        } catch let error as RosterStoreError {
+            // `.changedOnDisk` is transient: the newer data is already
+            // loaded, so the UI shows it and a retry succeeds.
+            if case .changedOnDisk = error {
+                throw error
+            }
+            persistentError = error
+            throw error
         }
         let applied = try validation()
         let snapshot = rosters
@@ -226,14 +335,112 @@ final class RosterStore {
         }
     }
 
+    /// Preflight shared by `mutate` and empty-target `switchDirectory`:
+    /// reloads incoming changes and throws `.changedOnDisk` rather than
+    /// letting a stale edit or stale snapshot win; records and throws the
+    /// blocking error when the location is broken.
+    private func adoptOrRejectExternalChanges() throws {
+        guard try diskChangedExternally() else { return }
+        try refresh()
+        throw RosterStoreError.changedOnDisk(path: fileURL.path)
+    }
+
     private func save() throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
             let data = try encoder.encode(rosters)
             try data.write(to: fileURL, options: [.atomic])
+            lastSeenBytes = data
+            fileExpected = true
         } catch {
             throw RosterStoreError.writeFailed(underlying: error.localizedDescription)
         }
+    }
+
+    // MARK: - Folder switching
+
+    /// Moves the store to `url` transactionally. A populated target is
+    /// adopted (its rosters become the visible library; its bytes are never
+    /// overwritten); an empty target receives the current rosters, published
+    /// by renaming a uniquely named temporary file into place. The former
+    /// file is never deleted or moved. Throws without changing any state
+    /// when the target is unusable or the source is out of date.
+    func switchDirectory(to url: URL) throws {
+        let target = url.resolvingSymlinksInPath().standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw RosterStoreError.unavailableDirectory(path: target.path)
+        }
+        if target == directory {
+            reload()
+            return
+        }
+        let targetFileURL = target.appendingPathComponent("rosters.json")
+        if FileManager.default.fileExists(atPath: targetFileURL.path) {
+            // Adopt the target library; on any failure change nothing.
+            let data: Data
+            do {
+                data = try Data(contentsOf: targetFileURL)
+            } catch {
+                throw RosterStoreError.readFailed(path: targetFileURL.path, underlying: error.localizedDescription)
+            }
+            let adopted: [Roster]
+            do {
+                adopted = try JSONDecoder().decode([Roster].self, from: data)
+            } catch {
+                throw RosterStoreError.corruptData(path: targetFileURL.path)
+            }
+            directory = target
+            rosters = adopted
+            lastSeenBytes = data
+            fileExpected = true
+            persistentError = nil
+            return
+        }
+        // Empty target: publish the current library there. Refuse when the
+        // source is unreadable or changed externally so a stale snapshot is
+        // never copied. A blocked source may still be escaped via a
+        // populated target above.
+        if let pendingError = persistentError {
+            throw pendingError
+        }
+        do {
+            try adoptOrRejectExternalChanges()
+        } catch let error as RosterStoreError {
+            if case .changedOnDisk = error {
+                throw error
+            }
+            persistentError = error
+            throw error
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let payload: Data
+        do {
+            payload = try encoder.encode(rosters)
+        } catch {
+            throw RosterStoreError.writeFailed(underlying: error.localizedDescription)
+        }
+        let temporaryURL = target.appendingPathComponent("rosters-incoming-\(UUID().uuidString).json")
+        do {
+            try payload.write(to: temporaryURL, options: [.atomic])
+            try FileManager.default.moveItem(at: temporaryURL, to: targetFileURL)
+        } catch {
+            try? FileManager.default.removeItem(at: temporaryURL)
+            let nsError = error as NSError
+            let targetAppearedNow =
+                (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileWriteFileExistsError)
+                || (nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(EEXIST))
+            if targetAppearedNow {
+                throw RosterStoreError.targetAppeared(path: targetFileURL.path)
+            }
+            throw RosterStoreError.writeFailed(underlying: error.localizedDescription)
+        }
+        directory = target
+        lastSeenBytes = payload
+        fileExpected = true
+        persistentError = nil
     }
 }

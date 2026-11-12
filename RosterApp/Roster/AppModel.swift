@@ -10,6 +10,10 @@ final class AppModel {
     let calendarService: CalendarService
     let automation: CalendarAutomation
 
+    /// UserDefaults key for the chosen rosters.json folder. Absent means
+    /// the default Application Support location.
+    static let storageDirectoryKey = "rosterStorageDirectory"
+
     enum Flow {
         case idle
         case previewing(event: EventSnapshot, rosterID: UUID)
@@ -55,6 +59,52 @@ final class AppModel {
         self.contactsService = contactsService
         self.calendarService = calendarService
         self.automation = automation
+    }
+
+    /// Builds the app's store: the saved folder when one was chosen,
+    /// otherwise the default Application Support library. A saved folder
+    /// that cannot be read surfaces a blocking error; it never silently
+    /// falls back to Application Support.
+    static func makeRosterStore() -> RosterStore {
+        if let path = UserDefaults.standard.string(forKey: storageDirectoryKey) {
+            return RosterStore(directory: URL(fileURLWithPath: path), requireExistingFile: true)
+        }
+        return RosterStore()
+    }
+
+    /// Switching storage is disabled mid-drag/review so roster references
+    /// held by the flow stay valid.
+    var canChangeStorageDirectory: Bool {
+        if case .idle = flow { return true }
+        return false
+    }
+
+    /// Switches to `url`, then persists the choice. Failures leave the
+    /// preference and store untouched and surface via `alertMessage`.
+    @discardableResult
+    func changeRosterDirectory(to url: URL) -> Bool {
+        do {
+            try rosterStore.switchDirectory(to: url)
+            UserDefaults.standard.set(url.path, forKey: Self.storageDirectoryKey)
+            return true
+        } catch {
+            alertMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    /// Switches back to the default Application Support library, then clears
+    /// the saved preference. Failures leave both untouched.
+    @discardableResult
+    func useDefaultRosterDirectory() -> Bool {
+        do {
+            try rosterStore.switchDirectory(to: RosterStore.defaultDirectory())
+            UserDefaults.standard.removeObject(forKey: Self.storageDirectoryKey)
+            return true
+        } catch {
+            alertMessage = error.localizedDescription
+            return false
+        }
     }
 
     func requestPermissions() async {

@@ -16,7 +16,7 @@ struct RosterApp: App {
 
     init() {
         model = AppModel(
-            rosterStore: RosterStore(),
+            rosterStore: AppModel.makeRosterStore(),
             contactsService: ContactsService(),
             calendarService: CalendarService(),
             automation: CalendarAutomation.shared
