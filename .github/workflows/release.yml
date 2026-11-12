@@ -100,8 +100,12 @@ jobs:
       - name: Compute build number
         id: buildnum
         run: |
-          echo "value=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-          echo "Build number: ${{ github.run_number }}"
+          # Offset so release builds always exceed previously distributed
+          # builds (Sparkle compares sparkle:version). Local dev builds have
+          # reached CFBundleVersion 6; +100 keeps releases safely above.
+          build_number=$(( ${{ github.run_number }} + 100 ))
+          echo "value=$build_number" >> "$GITHUB_OUTPUT"
+          echo "Build number: $build_number"
 
       # ── Build ──────────────────────────────────────────────────
       # With signing secrets configured, sign with Developer ID during
@@ -232,8 +236,18 @@ jobs:
           tag="${{ steps.version.outputs.tag }}"
           asset="build/${{ env.APP_NAME }}-${version}.zip"
 
+          # A build that is not signed AND notarized is not fit for normal
+          # outside-App-Store installation; label it as an unsigned/limited
+          # test with a prerelease marker so end-user updaters aren't
+          # pointed at it as a stable release.
+          extra_args=(--title "${{ env.APP_NAME }} $version")
+          if [[ -z "$DEVELOPER_ID_P12_BASE64" || -z "$NOTARY_KEY" ]]; then
+            echo "::warning::Release is not signed+notarized (missing DEVELOPER_ID_P12_BASE64 and/or NOTARY_KEY secrets) — publishing as prerelease."
+            extra_args+=(--prerelease --title "${{ env.APP_NAME }} $version (test build — unsigned or not notarized)")
+          fi
+
           gh release create "$tag" "$asset" \
-            --title "${{ env.APP_NAME }} $version" \
+            "${extra_args[@]}" \
             --generate-notes
 
       # ── Update Sparkle appcast (optional) ──────────────────────
