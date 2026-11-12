@@ -1,0 +1,286 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 1.0.1). A 'v'-prefixed tag will be created."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+# Required repository secrets (all optional — steps that need them are skipped
+# automatically when the secret is unset):
+#
+#   DEVELOPER_ID_P12_BASE64     Base64-encoded Developer ID Application .p12.
+#                               Export from Keychain Access → "Developer ID Application: …"
+#                               then: base64 -i Certificate.p12 | pbcopy
+#
+#   DEVELOPER_ID_P12_PASSWORD   Password used when exporting the .p12.
+#
+#   DEVELOPMENT_TEAM            Apple Developer Team ID for signing (e.g. 7E57633U38).
+#
+#   NOTARY_KEY                  App Store Connect API private key (.p8 file contents).
+#                               Generate at https://appstoreconnect.apple.com/access/integrations/api
+#                               Must be a Team key with "Developer" permission.
+#
+#   NOTARY_KEY_ID               The 10-character Key ID from App Store Connect.
+#
+#   NOTARY_ISSUER_ID            The Issuer ID (UUID) from App Store Connect.
+#
+#   SPARKLE_PRIVATE_KEY         EdDSA (ed25519) private key for Sparkle update signing.
+#                               Export with: sign_update -x private_key_file
+
+env:
+  SCHEME: Roster
+  APP_NAME: Roster
+  PROJECT: RosterApp/Roster.xcodeproj
+  ARCHIVE_PATH: build/Roster.xcarchive
+  # Sparkle signing tool version (independent of app integration)
+  SPARKLE_VERSION: "2.10.1"
+  MINIMUM_SYSTEM_VERSION: "26.0"
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: macos-26
+    steps:
+      # ── Check out ──────────────────────────────────────────────
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # ── Determine version ──────────────────────────────────────
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF#refs/tags/v}"
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version"  >> "$GITHUB_OUTPUT"
+          echo "Version: $version"
+
+      # ── Select latest Xcode ────────────────────────────────────
+      - name: Select latest Xcode
+        run: |
+          latest=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [[ -n "$latest" ]]; then
+            echo "Selecting $latest"
+            sudo xcode-select -s "$latest/Contents/Developer"
+          fi
+          echo "Active SDK: $(xcrun --show-sdk-version)"
+          echo "Swift: $(swift --version 2>&1 | head -1)"
+
+      # ── Import signing certificate (optional) ──────────────────
+      - name: Import signing certificate
+        if: env.DEVELOPER_ID_P12_BASE64 != ''
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          p12-password: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+
+      # ── Build number ───────────────────────────────────────────
+      # GitHub's auto-incrementing run number keeps builds monotonic
+      # across releases so Sparkle's sparkle:version comparison works.
+      - name: Compute build number
+        id: buildnum
+        run: |
+          echo "value=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "Build number: ${{ github.run_number }}"
+
+      # ── Build ──────────────────────────────────────────────────
+      - name: Build Release app
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project "${{ env.PROJECT }}" \
+            -scheme "${{ env.SCHEME }}" \
+            -destination 'platform=macOS' \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            CURRENT_PROJECT_VERSION="${{ steps.buildnum.outputs.value }}" \
+            | tee build/build.log
+
+      # ── Sign with Developer ID (optional) ──────────────────────
+      - name: Code sign app
+        if: env.DEVELOPER_ID_P12_BASE64 != ''
+        run: |
+          codesign --force --deep --timestamp --options runtime \
+            --sign "Developer ID Application" \
+            --entitlements RosterApp/Roster/Roster.entitlements \
+            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app"
+
+      # ── Package ────────────────────────────────────────────────
+      - name: Create release zip
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app" \
+            "build/${{ env.APP_NAME }}-${version}.zip"
+
+      # ── Notarize (optional) ────────────────────────────────────
+      - name: Write API key for notarization
+        if: env.NOTARY_KEY != ''
+        run: |
+          mkdir -p ~/.private_keys
+          echo '${{ secrets.NOTARY_KEY }}' > ~/.private_keys/AuthKey_${{ secrets.NOTARY_KEY_ID }}.p8
+
+      - name: Submit for notarization
+        if: env.NOTARY_KEY != ''
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          xcrun notarytool submit "build/${{ env.APP_NAME }}-${version}.zip" \
+            --key ~/.private_keys/AuthKey_${{ secrets.NOTARY_KEY_ID }}.p8 \
+            --key-id "${{ secrets.NOTARY_KEY_ID }}" \
+            --issuer "${{ secrets.NOTARY_ISSUER_ID }}" \
+            --wait --timeout 30m
+
+      - name: Staple notarization ticket
+        if: env.NOTARY_KEY != ''
+        run: |
+          xcrun stapler staple "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app"
+          xcrun stapler validate "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app"
+          # Re-zip so the release asset carries the stapled ticket
+          version="${{ steps.version.outputs.value }}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app" \
+            "build/${{ env.APP_NAME }}-${version}.zip"
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: build/*.log
+
+      # ── Sparkle signing (optional) ─────────────────────────────
+      # Downloads Sparkle's release tarball for its sign_update tool;
+      # independent of whether the app itself embeds Sparkle yet.
+      - name: Download Sparkle signing tools
+        if: env.SPARKLE_PRIVATE_KEY != ''
+        run: |
+          curl -L -o sparkle.tar.xz \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${{ env.SPARKLE_VERSION }}/Sparkle-${{ env.SPARKLE_VERSION }}.tar.xz"
+          tar -xf sparkle.tar.xz
+          ls -d Sparkle-*/bin/sign_update
+
+      - name: Sign update for Sparkle
+        if: env.SPARKLE_PRIVATE_KEY != ''
+        id: sparkle
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          SIGN_TOOL=$(ls -d Sparkle-*/bin/sign_update | head -1)
+
+          signature=$(echo "${{ secrets.SPARKLE_PRIVATE_KEY }}" \
+            | "$SIGN_TOOL" "build/${{ env.APP_NAME }}-${version}.zip" --ed-key-file -)
+
+          # signature output is like: sparkle:edSignature="..." length="..."
+          ed_signature=$(echo "$signature" | sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p')
+          length=$(echo "$signature" | sed -n 's/.*length="\([^"]*\)".*/\1/p')
+
+          echo "ed_signature=$ed_signature" >> "$GITHUB_OUTPUT"
+          echo "length=$length" >> "$GITHUB_OUTPUT"
+          echo "Sparkle signature generated (length: $length)"
+
+      # ── Create tag (workflow_dispatch only) ────────────────────
+      - name: Create tag (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          git tag "$tag"
+          git push origin "$tag"
+
+      # ── Publish release ────────────────────────────────────────
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          tag="${{ steps.version.outputs.tag }}"
+          asset="build/${{ env.APP_NAME }}-${version}.zip"
+
+          gh release create "$tag" "$asset" \
+            --title "${{ env.APP_NAME }} $version" \
+            --generate-notes
+
+      # ── Update Sparkle appcast (optional) ──────────────────────
+      - name: Update and publish appcast
+        if: env.SPARKLE_PRIVATE_KEY != ''
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.value }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          BUILD_NUMBER: ${{ steps.buildnum.outputs.value }}
+          ED_SIGNATURE: ${{ steps.sparkle.outputs.ed_signature }}
+          ZIP_LENGTH: ${{ steps.sparkle.outputs.length }}
+          APP_NAME: ${{ env.APP_NAME }}
+          MINIMUM_SYSTEM_VERSION: ${{ env.MINIMUM_SYSTEM_VERSION }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+
+          python3 - <<'PYEOF'
+          import os, datetime
+
+          version = os.environ["RELEASE_VERSION"]
+          tag = os.environ["RELEASE_TAG"]
+          build = os.environ["BUILD_NUMBER"]
+          sig = os.environ["ED_SIGNATURE"]
+          length = os.environ["ZIP_LENGTH"]
+          app = os.environ["APP_NAME"]
+          min_sys = os.environ["MINIMUM_SYSTEM_VERSION"]
+          repo = os.environ.get("GITHUB_REPOSITORY", "arthurlockman/Roster")
+          url = f"https://github.com/{repo}/releases/download/{tag}/{app}-{version}.zip"
+          pub_date = datetime.datetime.now(datetime.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+
+          import re
+          is_prerelease = bool(re.search(r'-(alpha|beta|rc)', version, re.IGNORECASE))
+          channel_line = "\n            <sparkle:channel>beta</sparkle:channel>" if is_prerelease else ""
+
+          appcast_path = "docs/appcast.xml"
+
+          # Read raw XML to preserve formatting; create it if missing
+          try:
+              with open(appcast_path, "r") as f:
+                  content = f.read()
+          except FileNotFoundError:
+              content = f"""<?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+              <channel>
+                  <title>{app}</title>
+                  <link>https://github.com/{repo}/releases</link>
+                  <description>Most recent {app} releases</description>
+                  <language>en</language>
+              </channel>
+          </rss>
+          """
+
+          # sparkle:version = CFBundleVersion (monotonic build number)
+          # sparkle:shortVersionString = CFBundleShortVersionString (marketing version)
+          new_item = f"""        <item>
+              <title>Version {version}</title>
+              <pubDate>{pub_date}</pubDate>{channel_line}
+              <enclosure url="{url}" sparkle:version="{build}" sparkle:shortVersionString="{version}" length="{length}" type="application/octet-stream" sparkle:edSignature="{sig}" />
+              <sparkle:minimumSystemVersion>{min_sys}</sparkle:minimumSystemVersion>
+          </item>"""
+
+          marker = "<language>en</language>"
+          content = content.replace(marker, marker + "\n" + new_item)
+
+          with open(appcast_path, "w") as f:
+              f.write(content)
+
+          print(f"Appcast updated for v{version} (build {build})")
+          PYEOF
+
+          git add docs/appcast.xml
+          git commit -m "Update appcast for v${RELEASE_VERSION}"
+          git push origin main
