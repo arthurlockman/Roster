@@ -98,6 +98,8 @@ nonisolated struct ScriptOutput: Decodable, Equatable {
     let message: String?
     /// Apple event error number behind a script "error" status, if any.
     let errorNumber: Int?
+    /// Read-backs the post-write check needed (apply only); >1 is logged.
+    let verifyAttempts: Int?
     /// Calendar-scripting uid, returned by the locate mode.
     let uid: String?
 }
@@ -251,10 +253,11 @@ final class CalendarAutomation {
             return (added, remaining)
         }
 
-        // EventKit can lag a write Calendar just made by a moment; give it
-        // one more look before asking Calendar again.
+        // EventKit can lag a write Calendar just made by a few seconds
+        // (longest for a changed occurrence); look up to three times, a
+        // second apart, before asking Calendar again.
         var eventKitEmails = currentAttendees()
-        if eventKitEmails.map({ split($0).remaining.isEmpty }) != true {
+        for _ in 0..<2 where eventKitEmails.map({ split($0).remaining.isEmpty }) != true {
             try? await Task.sleep(for: .seconds(1))
             eventKitEmails = currentAttendees() ?? eventKitEmails
         }
@@ -452,6 +455,7 @@ final class CalendarAutomation {
             \(mode, privacy: .public) failed: status=\(output?.status ?? "no-output", privacy: .public) \
             exit=\(run.exitStatus, privacy: .public) timedOut=\(run.timedOut, privacy: .public) \
             errorNumber=\(output?.errorNumber.map(String.init) ?? "none", privacy: .public) \
+            verifyAttempts=\(output?.verifyAttempts.map(String.init) ?? "none", privacy: .public) \
             message=\(output?.message ?? "", privacy: .private) warning=\(output?.warning ?? "", privacy: .private) \
             stderr=\(run.stderr, privacy: .private)
             """)
@@ -470,6 +474,9 @@ final class CalendarAutomation {
         let decoded = run.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(ScriptOutput.self, from: $0) }
         if run.timedOut || run.exitStatus != 0 || decoded == nil || decoded?.status == "error" || decoded?.warning != nil {
             Self.logFailure(mode: payload.mode, run: run, output: decoded)
+        } else if let attempts = decoded?.verifyAttempts, attempts > 1 {
+            // Data for tuning the post-write verification window.
+            Self.log.notice("apply confirmed after \(attempts, privacy: .public) read-backs (occurrenceOnly=\(payload.occurrenceOnly, privacy: .public))")
         }
         if run.timedOut {
             throw CalendarAutomationError.calendarTimedOut

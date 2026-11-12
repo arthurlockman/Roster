@@ -486,6 +486,8 @@ function output(status, fields) {
         // Apple event error number (e.g. -1743 not authorized, -1712
         // timeout) so the app can explain the failure without parsing text.
         errorNumber: typeof fields.errorNumber === "number" ? fields.errorNumber : null,
+        // How many read-backs the post-write check needed (apply only).
+        verifyAttempts: typeof fields.verifyAttempts === "number" ? fields.verifyAttempts : null,
         uid: fields.uid || ""
     };
     return JSON.stringify(result);
@@ -563,13 +565,18 @@ function run(argv) {
         // the same result and invite delivery without it, and it refreshed
         // every account in Calendar.
 
-        // Calendar can take a moment to finish saving, especially for an
-        // occurrence edited on its own: reading back right away has failed or
-        // returned the old list even though the write landed. Re-read a few
-        // times before deciding the write is unconfirmed (~1 s at most).
+        // Calendar can take a moment to finish saving: reading back right
+        // away has failed or returned the old list even though the write
+        // landed. A changed occurrence edited on its own is the slow case —
+        // its "/RID=" id stops resolving ("Can't get object") for a few
+        // seconds after the write — so it gets a longer window (~5 s vs
+        // ~1 s). The loop stops as soon as the write is confirmed.
         var afterEmails = null;
         var verifyError = null;
-        for (var attempt = 0; attempt < 4; attempt++) {
+        var maxAttempts = payload.occurrenceOnly === true ? 20 : 4;
+        var verifyAttempts = 0;
+        for (var attempt = 0; attempt < maxAttempts; attempt++) {
+            verifyAttempts = attempt + 1;
             if (attempt > 0) delay(0.25);
             try {
                 afterEmails = readAttendeeEmails(event);
@@ -585,7 +592,8 @@ function run(argv) {
         if (afterEmails === null) {
             return output("error", {
                 message: UNCONFIRMED_MESSAGE,
-                warning: appendError !== null ? appendError : "Reading invitees back failed: " + verifyError
+                warning: appendError !== null ? appendError : "Reading invitees back failed: " + verifyError,
+                verifyAttempts: verifyAttempts
             });
         }
 
@@ -613,7 +621,8 @@ function run(argv) {
             attendeeEmails: afterEmails,
             addedEmails: added,
             remainingEmails: remaining,
-            warning: finishWarning
+            warning: finishWarning,
+            verifyAttempts: verifyAttempts
         });
     } catch (e) {
         return output("error", { message: String(e.message || e), errorNumber: e.errorNumber });
