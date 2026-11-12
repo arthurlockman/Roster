@@ -50,7 +50,7 @@ env:
   SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
   # Sparkle signing tool version (independent of app integration)
   SPARKLE_VERSION: "2.10.1"
-  MINIMUM_SYSTEM_VERSION: "26.0"
+
 
 jobs:
   release:
@@ -114,6 +114,17 @@ jobs:
             -derivedDataPath build/DerivedData \
             CURRENT_PROJECT_VERSION="${{ steps.buildnum.outputs.value }}" \
             | tee build/build.log
+
+      # ── Minimum system version (from the built binary) ─────────
+      # Read from the app's Info.plist so the appcast can never drift
+      # from what the binary actually requires.
+      - name: Determine minimum system version
+        id: minsys
+        run: |
+          v=$(plutil -extract LSMinimumSystemVersion raw -o - \
+            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app/Contents/Info.plist")
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "Minimum system version: $v"
 
       # ── Sign with Developer ID (optional) ──────────────────────
       - name: Code sign app
@@ -227,7 +238,7 @@ jobs:
           ED_SIGNATURE: ${{ steps.sparkle.outputs.ed_signature }}
           ZIP_LENGTH: ${{ steps.sparkle.outputs.length }}
           APP_NAME: ${{ env.APP_NAME }}
-          MINIMUM_SYSTEM_VERSION: ${{ env.MINIMUM_SYSTEM_VERSION }}
+          MINIMUM_SYSTEM_VERSION: ${{ steps.minsys.outputs.value }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
