@@ -63,3 +63,6 @@ fastlane/test_output
 
 .DS_Store
 .localized
+
+## Build scratch
+build/

@@ -41,6 +41,13 @@ env:
   APP_NAME: Roster
   PROJECT: RosterApp/Roster.xcodeproj
   ARCHIVE_PATH: build/Roster.xcarchive
+  # Secrets bound to env so `env.X != ''` guards work per step
+  DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+  DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+  NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+  NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+  NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+  SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
   # Sparkle signing tool version (independent of app integration)
   SPARKLE_VERSION: "2.10.1"
   MINIMUM_SYSTEM_VERSION: "26.0"
