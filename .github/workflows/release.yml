@@ -44,6 +44,7 @@ env:
   # Secrets bound to env so `env.X != ''` guards work per step
   DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
   DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+  DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
   NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
   NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
   NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
@@ -103,15 +104,30 @@ jobs:
           echo "Build number: ${{ github.run_number }}"
 
       # ── Build ──────────────────────────────────────────────────
+      # With signing secrets configured, sign with Developer ID during
+      # the build (manual style, like Shifty); otherwise produce an
+      # unsigned ad-hoc build so a no-secrets dry run still passes.
       - name: Build Release app
         run: |
           set -o pipefail
+          sign_args=()
+          if [[ -n "$DEVELOPER_ID_P12_BASE64" ]]; then
+            sign_args+=(
+              CODE_SIGN_STYLE=Manual
+              CODE_SIGN_IDENTITY="Developer ID Application"
+              DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"
+              OTHER_CODE_SIGN_FLAGS="--timestamp --options runtime"
+            )
+          else
+            sign_args+=(CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=NO)
+          fi
           xcodebuild build \
             -project "${{ env.PROJECT }}" \
             -scheme "${{ env.SCHEME }}" \
             -destination 'platform=macOS' \
             -configuration Release \
             -derivedDataPath build/DerivedData \
+            "${sign_args[@]}" \
             CURRENT_PROJECT_VERSION="${{ steps.buildnum.outputs.value }}" \
             | tee build/build.log
 
@@ -264,7 +280,7 @@ jobs:
           channel_line = "\n            <sparkle:channel>beta</sparkle:channel>" if is_prerelease else ""
 
           appcast_path = "docs/appcast.xml"
-
+          os.makedirs("docs", exist_ok=True)
           # Read raw XML to preserve formatting; create it if missing
           try:
               with open(appcast_path, "r") as f:
