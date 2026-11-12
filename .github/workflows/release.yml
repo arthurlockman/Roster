@@ -107,13 +107,22 @@ jobs:
           echo "value=$build_number" >> "$GITHUB_OUTPUT"
           echo "Build number: $build_number"
 
-      # ── Build ──────────────────────────────────────────────────
-      # With signing secrets configured, sign with Developer ID during
-      # the build (manual style, like Shifty); otherwise produce an
-      # unsigned ad-hoc build so a no-secrets dry run still passes.
-      - name: Build Release app
+      # ── Resolve packages ───────────────────────────────────────
+      # Pre-fetch Sparkle's SPM package so archive/export are stable.
+      - name: Resolve Swift packages
         run: |
           mkdir -p build
+          xcodebuild -resolvePackageDependencies \
+            -project "${{ env.PROJECT }}" \
+            -scheme "${{ env.SCHEME }}" \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            | tee build/packages.log
+
+      # ── Archive ────────────────────────────────────────────────
+      # Archive with manual Developer ID signing (like Shifty); without
+      # signing secrets, produce an unsigned dry-run archive.
+      - name: Archive
+        run: |
           set -o pipefail
           sign_args=()
           if [[ -n "$DEVELOPER_ID_P12_BASE64" ]]; then
@@ -126,27 +135,61 @@ jobs:
           else
             sign_args+=(CODE_SIGN_IDENTITY=- CODE_SIGNING_ALLOWED=NO)
           fi
-          xcodebuild build \
+          xcodebuild archive \
             -project "${{ env.PROJECT }}" \
             -scheme "${{ env.SCHEME }}" \
-            -destination 'platform=macOS' \
             -configuration Release \
-            -derivedDataPath build/DerivedData \
+            -archivePath "${{ env.ARCHIVE_PATH }}" \
+            -clonedSourcePackagesDirPath build/SourcePackages \
             "${sign_args[@]}" \
             CURRENT_PROJECT_VERSION="${{ steps.buildnum.outputs.value }}" \
-            | tee build/build.log
+            | tee build/archive.log
 
-      # ── Minimum system version (from the built binary) ─────────
-      # Read from the app's Info.plist so the appcast can never drift
-      # from what the binary actually requires.
+      # ── Export ─────────────────────────────────────────────────
+      # Developer-id export re-signs every embedded framework (Sparkle)
+      # with Developer ID and strips get-task-allow. Without secrets,
+      # copy the unsigned archive product so the dry run still produces
+      # a zip.
+      - name: Export archive
+        run: |
+          mkdir -p build/export
+          if [[ -n "$DEVELOPER_ID_P12_BASE64" ]]; then
+            cat > /tmp/ExportOptions.plist <<'EOF'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>method</key>
+              <string>developer-id</string>
+              <key>teamID</key>
+              <string>${{ env.DEVELOPMENT_TEAM }}</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>signingCertificate</key>
+              <string>Developer ID Application</string>
+            </dict>
+            </plist>
+            EOF
+            xcodebuild -exportArchive \
+              -archivePath "${{ env.ARCHIVE_PATH }}" \
+              -exportOptionsPlist /tmp/ExportOptions.plist \
+              -exportPath build/export \
+              | tee build/export.log
+          else
+            cp -R "${{ env.ARCHIVE_PATH }}/Products/Applications/${{ env.APP_NAME }}.app" \
+              "build/export/${{ env.APP_NAME }}.app"
+          fi
+
+      # ── Minimum system version (from the exported app) ─────────
+      # Read from the exported app's Info.plist so the appcast can never
+      # drift from what the binary actually requires.
       - name: Determine minimum system version
         id: minsys
         run: |
           v=$(plutil -extract LSMinimumSystemVersion raw -o - \
-            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app/Contents/Info.plist")
+            "build/export/${{ env.APP_NAME }}.app/Contents/Info.plist")
           echo "value=$v" >> "$GITHUB_OUTPUT"
           echo "Minimum system version: $v"
-
 
       # ── Distributability gate ──────────────────────────────────
       # Only a signed AND notarized build may reach end-user updaters
@@ -159,18 +202,17 @@ jobs:
             echo "Build will be signed and notarized — appcast will be updated."
           else
             echo "value=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Missing DEVELOPER_ID_P12_BASE64 and/or NOTARY_KEY — skipping Sparkle appcast update (build is not distributable)."
+            echo "::warning::Missing DEVELOPER_ID_P12_BASE64 and/or NOTARY_KEY — build will ship as an unsigned/limited test release."
           fi
 
-      # ── Package ────────────────────────────────────────────────
-      - name: Create release zip
-        run: |
-          version="${{ steps.version.outputs.value }}"
-          ditto -c -k --sequesterRsrc --keepParent \
-            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app" \
-            "build/${{ env.APP_NAME }}-${version}.zip"
-
       # ── Notarize (optional) ────────────────────────────────────
+      - name: Create zip for notarization
+        if: env.NOTARY_KEY != ''
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "build/export/${{ env.APP_NAME }}.app" \
+            "build/${{ env.APP_NAME }}-notarize.zip"
+
       - name: Write API key for notarization
         if: env.NOTARY_KEY != ''
         run: |
@@ -180,8 +222,7 @@ jobs:
       - name: Submit for notarization
         if: env.NOTARY_KEY != ''
         run: |
-          version="${{ steps.version.outputs.value }}"
-          xcrun notarytool submit "build/${{ env.APP_NAME }}-${version}.zip" \
+          xcrun notarytool submit "build/${{ env.APP_NAME }}-notarize.zip" \
             --key ~/.private_keys/AuthKey_${{ secrets.NOTARY_KEY_ID }}.p8 \
             --key-id "${{ secrets.NOTARY_KEY_ID }}" \
             --issuer "${{ secrets.NOTARY_ISSUER_ID }}" \
@@ -190,12 +231,34 @@ jobs:
       - name: Staple notarization ticket
         if: env.NOTARY_KEY != ''
         run: |
-          xcrun stapler staple "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app"
-          xcrun stapler validate "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app"
-          # Re-zip so the release asset carries the stapled ticket
+          app_path="build/export/${{ env.APP_NAME }}.app"
+          ok=0
+          for attempt in 1 2 3 4; do
+            if xcrun stapler staple "$app_path"; then
+              ok=1
+              break
+            fi
+            echo "::warning::stapler staple failed (attempt $attempt) — ticket may not have propagated yet; retrying in 30s"
+            sleep 30
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Could not staple notarization ticket after 4 attempts"
+            exit 1
+          fi
+
+      - name: Verify notarization
+        if: env.NOTARY_KEY != ''
+        run: |
+          xcrun stapler validate "build/export/${{ env.APP_NAME }}.app"
+          spctl -a -vvv --type exec "build/export/${{ env.APP_NAME }}.app"
+
+      # ── Package final artifact ─────────────────────────────────
+      # Zip the stapled export so the release asset carries the ticket.
+      - name: Create release zip
+        run: |
           version="${{ steps.version.outputs.value }}"
           ditto -c -k --sequesterRsrc --keepParent \
-            "build/DerivedData/Build/Products/Release/${{ env.APP_NAME }}.app" \
+            "build/export/${{ env.APP_NAME }}.app" \
             "build/${{ env.APP_NAME }}-${version}.zip"
 
       - name: Upload build logs
