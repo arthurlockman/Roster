@@ -55,7 +55,7 @@ env:
 jobs:
   release:
     name: Build & Release
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
       # ── Check out ──────────────────────────────────────────────
       - name: Check out repository
