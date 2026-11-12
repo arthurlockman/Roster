@@ -271,22 +271,14 @@ jobs:
           path: build/*.log
 
       # ── Sparkle signing (optional) ─────────────────────────────
-      # Downloads Sparkle's release tarball for its sign_update tool;
-      # independent of whether the app itself embeds Sparkle yet.
-      - name: Download Sparkle signing tools
-        if: env.SPARKLE_PRIVATE_KEY != '' && steps.distributable.outputs.value == 'true'
-        run: |
-          curl -L -o sparkle.tar.xz \
-            "https://github.com/sparkle-project/Sparkle/releases/download/${{ env.SPARKLE_VERSION }}/Sparkle-${{ env.SPARKLE_VERSION }}.tar.xz"
-          tar -xf sparkle.tar.xz
-          ls -d Sparkle-*/bin/sign_update
-
+      # Uses sign_update from the resolved Sparkle SPM package
+      # (already fetched for the build), like Shifty.
       - name: Sign update for Sparkle
         if: env.SPARKLE_PRIVATE_KEY != '' && steps.distributable.outputs.value == 'true'
         id: sparkle
         run: |
           version="${{ steps.version.outputs.value }}"
-          SIGN_TOOL=$(ls -d Sparkle-*/bin/sign_update | head -1)
+          SIGN_TOOL="build/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
 
           signature=$(echo "${{ secrets.SPARKLE_PRIVATE_KEY }}" \
             | "$SIGN_TOOL" "build/${{ env.APP_NAME }}-${version}.zip" --ed-key-file -)
