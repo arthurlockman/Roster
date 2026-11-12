@@ -112,6 +112,7 @@ jobs:
       - name: Resolve Swift packages
         run: |
           mkdir -p build
+          set -o pipefail
           xcodebuild -resolvePackageDependencies \
             -project "${{ env.PROJECT }}" \
             -scheme "${{ env.SCHEME }}" \
@@ -152,24 +153,25 @@ jobs:
       # a zip.
       - name: Export archive
         run: |
+          set -o pipefail
           mkdir -p build/export
+          cat > /tmp/ExportOptions.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>developer-id</string>
+            <key>teamID</key>
+            <string>${{ env.DEVELOPMENT_TEAM }}</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Developer ID Application</string>
+          </dict>
+          </plist>
+          EOF
           if [[ -n "$DEVELOPER_ID_P12_BASE64" ]]; then
-            cat > /tmp/ExportOptions.plist <<'EOF'
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-              <key>method</key>
-              <string>developer-id</string>
-              <key>teamID</key>
-              <string>${{ env.DEVELOPMENT_TEAM }}</string>
-              <key>signingStyle</key>
-              <string>manual</string>
-              <key>signingCertificate</key>
-              <string>Developer ID Application</string>
-            </dict>
-            </plist>
-            EOF
             xcodebuild -exportArchive \
               -archivePath "${{ env.ARCHIVE_PATH }}" \
               -exportOptionsPlist /tmp/ExportOptions.plist \
