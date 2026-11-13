@@ -10,8 +10,9 @@ import SwiftUI
 
 @main
 struct RosterApp: App {
+    static let updateCheckLogger = UpdateCheckLogger()
     let updaterController = SPUStandardUpdaterController(
-        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+        startingUpdater: true, updaterDelegate: RosterApp.updateCheckLogger, userDriverDelegate: nil)
     @State private var model: AppModel
 
     init() {
