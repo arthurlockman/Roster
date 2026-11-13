@@ -76,7 +76,7 @@
         "INFOPLIST_KEY_NSAppleEventsUsageDescription": "Add confirmed missing invitees to events in Calendar.",
         "INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription": "Show events on the calendars you select and check their invitees.",
         "INFOPLIST_KEY_NSContactsUsageDescription": "Find contacts to add to your invite sets.",
-        "INFOPLIST_KEY_NSHumanReadableCopyright": "",
+        "INFOPLIST_KEY_NSHumanReadableCopyright": "© 2026 Arthur Rosa",
         "LD_RUNPATH_SEARCH_PATHS": [
           "$(inherited)",
           "@executable_path/../Frameworks",
