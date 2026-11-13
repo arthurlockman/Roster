@@ -281,6 +281,12 @@ struct ContentView: View {
                 }
                 .help("Show the walkthrough again")
                 Button {
+                    Support.openIssueReporter()
+                } label: {
+                    Label("Report a Bug", systemImage: "ladybug")
+                }
+                .help("Report a bug or request a feature on GitHub")
+                Button {
                     do { _ = try model.rosterStore.createRoster(named: "New roster") }
                     catch { model.alertMessage = error.localizedDescription }
                 } label: {

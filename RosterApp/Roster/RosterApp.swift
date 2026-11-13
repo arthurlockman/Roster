@@ -5,6 +5,7 @@
 //  Created by Arthur Rosa on 2026-11-11.
 //
 
+import AppKit
 import Sparkle
 import SwiftUI
 
@@ -49,6 +50,21 @@ struct RosterApp: App {
                     updaterController.checkForUpdates(nil)
                 }
             }
+            CommandGroup(after: .help) {
+                Button("Report a Bug…") {
+                    Support.openIssueReporter()
+                }
+            }
         }
+    }
+}
+
+/// Where bug reports and feature requests go.
+nonisolated enum Support {
+    /// GitHub's pre-filled new-issue form.
+    static let issuesURL = URL(string: "https://github.com/arthurlockman/Roster/issues/new")!
+
+    static func openIssueReporter() {
+        NSWorkspace.shared.open(issuesURL)
     }
 }
