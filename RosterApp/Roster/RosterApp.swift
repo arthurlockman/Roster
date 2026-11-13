@@ -26,6 +26,21 @@ struct RosterApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(model: model)
+                .task {
+                    guard updaterController.updater.automaticallyChecksForUpdates else { return }
+                    // Sparkle's startup schedules its own check cycle and
+                    // rejects a concurrent call with .sessionInProgress, so
+                    // wait until it can accept one. Without this, the launch
+                    // check always loses that race and the app never checks
+                    // on open until the scheduled interval elapses.
+                    let updater = updaterController.updater
+                    for _ in 0..<100 {
+                        if updater.canCheckForUpdates { break }
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                    guard updater.canCheckForUpdates else { return }
+                    updater.checkForUpdatesInBackground()
+                }
         }
         .commands {
             CommandGroup(after: .appInfo) {
