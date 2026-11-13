@@ -254,9 +254,12 @@ final class CalendarService {
     /// - For other occurrences the dropped occurrence is re-fetched; its
     ///   invitees are the series'. `event(withIdentifier:)` would return the
     ///   series' first occurrence, which may itself be detached.
-    /// - EventKit reports "no invitees" as `attendees == nil`; with
-    ///   `hasAttendees == false` that is a known empty list. Treating it as
-    ///   empty is safe because apply re-reads attendees in Calendar first.
+    /// - EventKit materializes participant data lazily: an event Calendar.app
+    ///   already shows with invitees can briefly read as `attendees == nil`
+    ///   with `hasAttendees == false`. Neither is trusted — an empty claim
+    ///   fails closed to the osascript preview, which reads exactly what
+    ///   apply writes to. A non-empty list proves the data loaded and is
+    ///   taken at face value.
     ///
     /// EKParticipant exposes its address only as a mailto: URL; keys are
     /// normalized exactly like the script normalizes emails.
@@ -267,10 +270,9 @@ final class CalendarService {
         guard accessState == .authorized, !snapshot.eventIdentifier.isEmpty else { return nil }
         guard snapshot.isDetached == onlyThisOccurrence else { return nil }
         guard let event = currentEvent(for: snapshot), event.isDetached == onlyThisOccurrence else { return nil }
-        guard let attendees = event.attendees else {
-            return event.hasAttendees ? nil : []
-        }
-        return attendees.compactMap { normalizedEmailKey($0.url.absoluteString) }
+        guard let attendees = event.attendees else { return nil }
+        let keys = attendees.compactMap { normalizedEmailKey($0.url.absoluteString) }
+        return keys.isEmpty ? nil : keys
     }
 
     /// The live EKEvent for a snapshot: by identifier for a one-off event,
