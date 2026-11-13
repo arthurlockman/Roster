@@ -21,6 +21,16 @@ struct ContentView: View {
                 .frame(minWidth: 320, maxWidth: 520, maxHeight: .infinity)
         }
         .frame(minWidth: 900, minHeight: 560)
+        .toolbar {
+            ToolbarItem {
+                Button {
+                    Support.openIssueReporter()
+                } label: {
+                    Label("Report a Bug", systemImage: "ladybug")
+                }
+                .help("Report a bug or request a feature on GitHub")
+            }
+        }
         .task {
             // First-run walkthrough goes first; macOS permission prompts
             // would otherwise land on top of the instructions.
@@ -280,12 +290,6 @@ struct ContentView: View {
                     Label("How to use", systemImage: "questionmark.circle")
                 }
                 .help("Show the walkthrough again")
-                Button {
-                    Support.openIssueReporter()
-                } label: {
-                    Label("Report a Bug", systemImage: "ladybug")
-                }
-                .help("Report a bug or request a feature on GitHub")
                 Button {
                     do { _ = try model.rosterStore.createRoster(named: "New roster") }
                     catch { model.alertMessage = error.localizedDescription }
