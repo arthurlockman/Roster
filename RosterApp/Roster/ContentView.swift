@@ -24,6 +24,14 @@ struct ContentView: View {
         .toolbar {
             ToolbarItem {
                 Button {
+                    showingOnboarding = true
+                } label: {
+                    Label("How to Use", systemImage: "questionmark.circle")
+                }
+                .help("Show the walkthrough again")
+            }
+            ToolbarItem {
+                Button {
                     Support.openIssueReporter()
                 } label: {
                     Label("Report a Bug", systemImage: "ladybug")
@@ -284,12 +292,6 @@ struct ContentView: View {
                 }
                 .disabled(!model.canChangeStorageDirectory)
                 .help("Choose where rosters.json lives")
-                Button {
-                    showingOnboarding = true
-                } label: {
-                    Label("How to use", systemImage: "questionmark.circle")
-                }
-                .help("Show the walkthrough again")
                 Button {
                     do { _ = try model.rosterStore.createRoster(named: "New roster") }
                     catch { model.alertMessage = error.localizedDescription }

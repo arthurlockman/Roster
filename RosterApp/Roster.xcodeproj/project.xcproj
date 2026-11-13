@@ -20,7 +20,21 @@
     },
   ],
   "files": [
-    { "kind": "folder", "path": "Roster", "target-membership": [ "Roster" ], "membership-exceptions": [ { "target": "Roster", "exclusions": [ "Info.plist" ] } ] },
+    {
+      "kind": "folder",
+      "path": "Roster",
+      "target-membership": [
+        "Roster",
+      ],
+      "membership-exceptions": [
+        {
+          "target": "Roster",
+          "exclusions": [
+            "Info.plist",
+          ],
+        },
+      ],
+    },
     { "kind": "folder", "path": "RosterTests", "target-membership": [ "RosterTests" ] },
     {
       "kind": "group",
